@@ -122,6 +122,10 @@ public final class PlatformDependent {
     private static final long DIRECT_MEMORY_LIMIT;
     private static final Cleaner CLEANER;
     private static final Cleaner LEGACY_CLEANER;
+    // 是否支持一种特殊的、非标准的数组创建方式
+    // 在标准的Java中,当你执行new byte[size]时,JVM会分配内存，并且自动将内存中的每一位都清零(初始化为0)，但在某些高性能场景下,如果你紧接着
+    // 就要往这个数组里完全覆盖写入数据，那么JVM先"清零"再"写入"的操作就是多余的计算，浪费CPU周期
+    // java的底层库(Unsafe类)或者某些特定版本的JDK提供了一种方法,可以分配内存但不进行初始化
     private static final boolean HAS_ALLOCATE_UNINIT_ARRAY;
     private static final String LINUX_ID_PREFIX = "ID=";
     private static final String LINUX_ID_LIKE_PREFIX = "ID_LIKE=";
@@ -392,6 +396,7 @@ public final class PlatformDependent {
     }
 
     public static byte[] allocateUninitializedArray(int size) {
+        // 为什么要做这个判断 查看HAS_ALLOCATE_UNINIT_ARRAY变量上的注释说明
         return HAS_ALLOCATE_UNINIT_ARRAY ?  PlatformDependent0.allocateUninitializedArray(size) : new byte[size];
     }
 

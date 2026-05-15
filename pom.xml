@@ -786,7 +786,7 @@
     <module>codec-base</module>
     <module>codec-compression</module>
     <module>codec-protobuf</module>
-    <module>codec-marshalling</module>
+<!--    <module>codec-marshalling</module>-->
     <module>codec</module>
     <module>codec-dns</module>
     <module>codec-haproxy</module>
@@ -794,9 +794,15 @@
     <module>codec-http2</module>
     <module>codec-memcache</module>
     <module>codec-mqtt</module>
-    <module>codec-classes-quic</module>
-    <module>codec-native-quic</module>
-    <module>codec-http3</module>
+<!--    <module>codec-classes-quic</module>-->
+    <!--这是netty对QUIC协议的核心实现模块,QUIC是一种基于UDP的新型传输协议,旨在取代TCP，
+    该模块是一个Native模块，它不是纯java代码，而是通过JNI调用Google开发的BoringSSL c语言库来实现
+    QUIC的加密和传输逻辑，编译时需要下载并编译BoringSSL源码，这要求系统必须安装CMake、Go语言环境
+    、Perl以及特定版本的编译器，BoringSSL的源码托管在Google的服务器上，国内网络极难直接访问
+    如果你知识普通的开发HTTP1 或者HTTP2 或者使用TCP/UDP通信，完全不需要这个模块。这个模块主要时实现HTTP3协议
+     -->
+<!--    <module>codec-native-quic</module>-->
+<!--    <module>codec-http3</module>-->
     <module>codec-redis</module>
     <module>codec-smtp</module>
     <module>codec-socks</module>
@@ -804,17 +810,25 @@
     <module>codec-xml</module>
     <module>resolver</module>
     <module>resolver-dns</module>
-    <module>resolver-dns-classes-macos</module>
-    <module>resolver-dns-native-macos</module>
+    <!-- 利用macOS原生的api进行DNS解析的模块，性能比纯java实现更好 这部分是对应的java类部分-->
+<!--    <module>resolver-dns-classes-macos</module>-->
+    <!-- 利用macOS原生的api进行DNS解析的模块，性能比纯java实现更好 -->
+<!--    <module>resolver-dns-native-macos</module>-->
     <module>transport</module>
     <module>transport-native-unix-common-tests</module>
     <module>transport-native-unix-common</module>
-    <module>transport-classes-epoll</module>
-    <module>transport-native-epoll</module>
-    <module>transport-classes-io_uring</module>
-    <module>transport-native-io_uring</module>
-    <module>transport-classes-kqueue</module>
-    <module>transport-native-kqueue</module>
+    <!-- 这是epoll模块的纯java类部分，通常与transport-native-epoll一起使用，虽然它本身时java代码，但在Windows上如果不适用epoll功能，也可以跳过-->
+<!--    <module>transport-classes-epoll</module>-->
+    <!-- netty在linux上高新能的核心。它使用jni调用linux的epoll系统调用，替代Java NIO的Selector，实现更搞笑的网络IO -->
+<!--    <module>transport-native-epoll</module>-->
+    <!-- 这是针对Linux5.1+内核最新的异步IO机制io_uring的支持。比epoll更先进，性能更强,这是io_uring的java类部分-->
+<!--    <module>transport-classes-io_uring</module>-->
+    <!-- 这是针对Linux5.1+内核最新的异步IO机制io_uring的支持。比epoll更先进，性能更强-->
+<!--    <module>transport-native-io_uring</module>-->
+    <!-- macOS/BSD 专用模块,windows下必须跳过-->
+<!--    <module>transport-classes-kqueue</module>-->
+    <!-- macOS/BSD 专用模块,windows下必须跳过-->
+<!--    <module>transport-native-kqueue</module>-->
     <module>transport-rxtx</module>
     <module>transport-sctp</module>
     <module>transport-udt</module>
@@ -822,21 +836,23 @@
     <module>handler-proxy</module>
     <module>handler-ssl-ocsp</module>
     <module>example</module>
-    <module>testsuite</module>
+<!--    <module>testsuite</module>-->
     <module>pkitesting</module>
-    <module>testsuite-autobahn</module>
-    <module>testsuite-common</module>
-    <module>testsuite-http2</module>
-    <module>testsuite-jpms</module>
-    <module>testsuite-karaf</module>
-    <module>testsuite-osgi</module>
-    <module>testsuite-shading</module>
-    <module>testsuite-native</module>
-    <module>testsuite-native-image</module>
-    <module>testsuite-native-image-client</module>
-    <module>testsuite-native-image-client-runtime-init</module>
-    <module>transport-blockhound-tests</module>
-    <module>microbench</module>
+    <!-- 这部分是test，可以跳过 -->
+<!--    <module>testsuite-autobahn</module>-->
+<!--    <module>testsuite-common</module>-->
+<!--    <module>testsuite-http2</module>-->
+<!--    <module>testsuite-jpms</module>-->
+<!--    <module>testsuite-karaf</module>-->
+<!--    <module>testsuite-osgi</module>-->
+<!--    <module>testsuite-shading</module>-->
+<!--    <module>testsuite-native</module>-->
+<!--    <module>testsuite-native-image</module>-->
+<!--    <module>testsuite-native-image-client</module>-->
+<!--    <module>testsuite-native-image-client-runtime-init</module>-->
+<!--    <module>transport-blockhound-tests</module>-->
+    <!-- 用来做微基准测试的，通常在开发或编译核心库时不是必须的。这里用了linux epoll和macOS kqueue专用的类，排除本模块 -->
+<!--    <module>microbench</module>-->
     <module>jfr-stub</module>
     <module>varhandle-stub</module>
     <module>bom</module>

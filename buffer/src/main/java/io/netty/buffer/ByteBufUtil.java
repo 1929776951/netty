@@ -104,6 +104,7 @@ public final class ByteBufUtil {
         logger.debug("-Dio.netty.maxThreadLocalCharBufferSize: {}", MAX_CHAR_BUFFER_SIZE);
     }
 
+    // 线程本地数组最大长度 允许从threadLocal中获取的字节数组的最大长度
     static final int MAX_TL_ARRAY_LEN = 1024;
 
     /**

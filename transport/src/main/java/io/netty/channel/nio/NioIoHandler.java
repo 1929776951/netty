@@ -272,6 +272,7 @@ public final class NioIoHandler implements IoHandler {
         for (SelectionKey key : oldSelector.keys()) {
             DefaultNioRegistration handle = (DefaultNioRegistration) key.attachment();
             try {
+                // keyFor 方法 判断某个channel是否已经在selector上注册过，如果注册过，返回对应的SelectionKey 如果没有返回null
                 if (!key.isValid() || key.channel().keyFor(newSelectorTuple.unwrappedSelector) != null) {
                     continue;
                 }

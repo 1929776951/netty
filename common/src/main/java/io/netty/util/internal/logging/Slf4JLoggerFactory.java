@@ -59,6 +59,12 @@ public class Slf4JLoggerFactory extends InternalLoggerFactory {
         return NopInstanceHolder.INSTANCE_WITH_NOP_CHECK;
     }
 
+    // 为什么不直接定义一个镜头变量 还有高一个静态内部类
+    // 这是一种初始化延迟持有者模式 主要是为了懒加载和性能优化
+    // 如果直接定义一个静态变量，不用这个静态私有内部类包装，那么当JVM加载外部类Slf4JLoggerFactory的时候，就会初始化，如果初始化过程
+    // 过程中new Slf4JLoggerFactory(true) 这个操作很重，哪怕你不需要用到这个变量，这部分开销也会被强制执行，从而拖慢了主类的加载速度
+    // 用静态内部类后，加载Slf4JLoggerFactory这个类的时候，NopInstanceHolder不会被加载，只有等到getInstanceWithNopCheck()方法
+    // 被调用的时候，才会加载。 如果运行期间完全没有用到这个方法，那这部分开销就完全省下来了
     private static final class NopInstanceHolder {
         private static final InternalLoggerFactory INSTANCE_WITH_NOP_CHECK = new Slf4JLoggerFactory(true);
     }
