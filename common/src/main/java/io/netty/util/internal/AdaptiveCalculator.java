@@ -33,11 +33,20 @@ public final class AdaptiveCalculator {
 
     static {
         List<Integer> sizeTable = new ArrayList<Integer>();
+        // 从 16 开始，每次加 16，直到 512（不包含）。
+        // 在内存需求量较小时，采用线性增长。
+        // 因为小包对内存浪费很敏感（比如只发 20 字节，分配 1024 就浪费了），
+        // 所以步进小一点（16字节），能更精准地匹配小数据包，减少内存浪费。
         for (int i = 16; i < 512; i += 16) {
             sizeTable.add(i);
         }
 
         // Suppress a warning since i becomes negative when an integer overflow happens
+        // 从 512 开始，每次左移 1 位（即乘以 2），直到整数溢出变为负数停止。
+        //生成的数据：512, 1024, 2048, 4096, 8192, ..., 1073741824 (1GB)。
+        // 在内存需求量较大时，采用指数增长。
+        // 当数据量变大（比如几 MB）时，几百字节的误差已经不重要了。此时更重要的是减少扩容的次数。
+        // 每次翻倍，可以快速适应流量的激增。
         for (int i = 512; i > 0; i <<= 1) {
             sizeTable.add(i);
         }
@@ -48,6 +57,7 @@ public final class AdaptiveCalculator {
         }
     }
 
+    // 采用二分法，找到需要大小在SIZE_TABLE中的索引位置
     private static int getSizeTableIndex(final int size) {
         for (int low = 0, high = SIZE_TABLE.length - 1;;) {
             if (high < low) {

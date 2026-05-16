@@ -25,7 +25,14 @@ import static io.netty.util.internal.ObjectUtil.checkNotNull;
 /**
  * Allocates a new receive buffer whose capacity is probably large enough to read all inbound data and small enough
  * not to waste its space.
+ * 分配一个新的接收缓冲区，其容量应当足够大以读取所有入站数据，同时又足够小以避免浪费空间。
  */
+// 这个接口的作用是动态决定Netty在读取网络数据时，应申请多大的内存缓冲区
+// 这个接口是一个策略层，它通常作为配置的一部分，绑定在 ChannelConfig 上，是全局共享的（或者每个 Channel 共享一个）
+// Handle它是在每一次 IO 读循环开始时创建的。 它负责记录某一次读取过程中的临时状态。
+// 这种使用内部Handle的设计的好处: 1、状态隔离：每次 IO 读取操作都有自己独立的“记事本”（Handle），互不干扰。
+// 2、无锁并发：因为状态在局部变量（Handle）中，不需要加锁，性能极高
+// Allocator 是工厂（决定用什么算法），Handle 是记事本（记录这一次干活的进度）。工厂不能把给 A 客户干活的进度记在 B 客户的单子上。
 public interface RecvByteBufAllocator {
     /**
      * Creates a new handle.  The handle provides the actual operations and keeps the internal information which is

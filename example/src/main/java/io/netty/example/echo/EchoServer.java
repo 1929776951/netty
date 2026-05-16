@@ -16,6 +16,7 @@
 package io.netty.example.echo;
 
 import io.netty.bootstrap.ServerBootstrap;
+import io.netty.buffer.ByteBufUtil;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
@@ -38,6 +39,10 @@ public final class EchoServer {
     static final int PORT = Integer.parseInt(System.getProperty("port", "8007"));
 
     public static void main(String[] args) throws Exception {
+
+        String str = ByteBufUtil.hexDump("我是中国人".getBytes());
+
+
         // Configure SSL.
         final SslContext sslCtx = ServerUtil.buildSslContext();
 

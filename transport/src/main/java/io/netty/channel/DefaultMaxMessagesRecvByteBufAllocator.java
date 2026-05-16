@@ -26,8 +26,13 @@ import io.netty.util.UncheckedBooleanSupplier;
  * and also prevents overflow.
  */
 public abstract class DefaultMaxMessagesRecvByteBufAllocator implements MaxMessagesRecvByteBufAllocator {
+    //用于控制是否忽略已读取的字节数。
+    // 在某些特定的实现中，可能只关心读取的次数，而不关心实际读了多少字节。这个标志位允许子类或配置来调整这种行为。
     private final boolean ignoreBytesRead;
     private volatile int maxMessagesPerRead;
+    // 这个字段控制是否尊重“可能还有更多数据”的信号。
+    // 这是一个高级优化选项。如果设置为 true，当底层传输（如 Epoll）提示“可能还有更多数据”时，
+    // Netty 可能会继续读取，即使已经达到了 maxMessagesPerRead 的限制。这通常用于提高吞吐量，但可能会牺牲一定的公平性。
     private volatile boolean respectMaybeMoreData = true;
 
     public DefaultMaxMessagesRecvByteBufAllocator() {

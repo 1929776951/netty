@@ -151,6 +151,8 @@ public abstract class AbstractNioByteChannel extends AbstractNioChannel {
             final ChannelPipeline pipeline = pipeline();
             final ByteBufAllocator allocator = config.getAllocator();
             final RecvByteBufAllocator.Handle allocHandle = recvBufAllocHandle();
+            // 因为对于一个channel来说allocHandle对象是有一个，recvBufAllocHandle()里面的逻辑是如果不为空就返回
+            // 否则就new一个RecvByteBufAllocator.Handle ,所以对于一个channel,每次去读之前都要充重置一下里面的值
             allocHandle.reset(config);
 
             ByteBuf byteBuf = null;

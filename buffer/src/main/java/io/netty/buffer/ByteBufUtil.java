@@ -66,6 +66,7 @@ public final class ByteBufUtil {
         }
     };
 
+    // 当遇到无法编码或未知的字符时，直接写入一个问号 ? 的字节值（即 0x3F）。
     private static final byte WRITE_UTF_UNKNOWN = (byte) '?';
     private static final int MAX_CHAR_BUFFER_SIZE;
     private static final int THREAD_LOCAL_BUFFER_SIZE;
@@ -1523,6 +1524,9 @@ public final class ByteBufUtil {
 
         static {
             final char[] DIGITS = "0123456789abcdef".toCharArray();
+            // i >>> 4 无符号右移四位，就是取高四位，然后& 0x0F 就是取低四位 就是0-15的值，然后从DIGITS取出对应的字符
+            // 相当于获取了i对应的二进制高四位对应的16进制字符
+            // 直接i & 0x0F 就是取i的低四位,然后再从DIGITS数组中取出对应的字符
             for (int i = 0; i < 256; i ++) {
                 HEXDUMP_TABLE[ i << 1     ] = DIGITS[i >>> 4 & 0x0F];
                 HEXDUMP_TABLE[(i << 1) + 1] = DIGITS[i       & 0x0F];
@@ -1531,6 +1535,10 @@ public final class ByteBufUtil {
             int i;
 
             // Generate the lookup table for hex dump paddings
+            // Hex Dump 不仅仅是把字节转成十六进制，
+            // 它还需要排版（比如每 16 个字节换一行）。
+            // 如果最后一行不足 16 个字节，就需要用空格填充，以保持右侧 ASCII 预览区的对齐。
+            // 这段代码就是在预先计算好各种长度的空格字符串，以便后续直接使用，避免重复创建。
             for (i = 0; i < HEXPADDING.length; i ++) {
                 int padding = HEXPADDING.length - i;
                 StringBuilder buf = new StringBuilder(padding * 3);
@@ -1567,6 +1575,12 @@ public final class ByteBufUtil {
 
             // Generate the lookup table for byte-to-char conversion
             for (i = 0; i < BYTE2CHAR.length; i ++) {
+                // i <= 0x1f (0-31)：这是 ASCII 码中的控制字符。包括换行符、回车符、制表符、响铃符等。
+                // 为什么要替换？ 如果直接在日志里打印这些字符，会导致日志换行错乱、光标移动，甚至让终端发出“哔哔”声，破坏日志的可读性。
+                // i >= 0x7f (127-255)： 0x7f (127) 是删除符。
+                //128-255 是扩展 ASCII 码。
+                //为什么要替换？ 在纯 ASCII 环境下，这些高位字符可能是乱码，或者在不同编码下显示不一致。
+                // 为了保证 Hex Dump 的整洁和通用性，Netty 选择将它们统一视为“非标准字符”并用点代替。
                 if (i <= 0x1f || i >= 0x7f) {
                     BYTE2CHAR[i] = '.';
                 } else {
@@ -1582,6 +1596,7 @@ public final class ByteBufUtil {
             }
 
             int endIndex = fromIndex + length;
+            // 一个字节8位，16进制中一个字节需要两个字符表示 所以这里字符的格式要乘以字节的2倍
             char[] buf = new char[length << 1];
 
             int srcIdx = fromIndex;

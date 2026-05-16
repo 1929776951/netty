@@ -840,7 +840,7 @@
     <module>pkitesting</module>
     <!-- 这部分是test，可以跳过 -->
 <!--    <module>testsuite-autobahn</module>-->
-<!--    <module>testsuite-common</module>-->
+    <module>testsuite-common</module>
 <!--    <module>testsuite-http2</module>-->
 <!--    <module>testsuite-jpms</module>-->
 <!--    <module>testsuite-karaf</module>-->
