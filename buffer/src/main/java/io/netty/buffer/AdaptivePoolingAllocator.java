@@ -1543,19 +1543,29 @@ final class AdaptivePoolingAllocator {
         // 如果你想把另一个数字拼接到 0xFFFF 的左边（高位），你需要把它向左移动 PACK_SIZE_SHIFT 位
         // int 打包后的结果 = (5 << PACK_SIZE_SHIFT) | 100; 这个值为327780， 在二进制里，它就是前半截存着 5，后半截存着 100）
         private static final int PACK_SIZE_SHIFT = Integer.SIZE - Integer.numberOfLeadingZeros(PACK_OFFSET_MASK);
-
+        // 这是一个多生产者单消费者队列，专门用来存储 int 类型的整数。
+        // 当有内存块被释放时 Netty会把代表内存信息的打包后的整数存储到这个队列
+        // 因为 Netty 的高性能特性，可能会有多个线程同时释放内存（生产者多），但通常由一个线程负责处理分配逻辑（消费者单），
+        // 这种队列在并发环境下比标准的 LinkedList 或 ArrayBlockingQueue 更快，因为它减少了锁的竞争
         private final MpscIntQueue freeList;
         // The bits of each buddy: [1: is claimed][1: has claimed children][30: MIN_BUDDY_SIZE shift to get size]
         // 这是伙伴算法的元数据核心。它并不存储实际数据，而是存储每个内存块的状态。
         private final byte[] buddies;
+        // 记录 freeList 的容量上限 freeList的size大小
         private final int freeListCapacity;
 
         BuddyChunk(AbstractByteBuf delegate, Magazine magazine) {
             super(delegate, magazine, true);
+            // 一般默认的delegate.capacity() 是16MB,MIN_BUDDY_SIZE是32KB freeListCapacity是512
             freeListCapacity = delegate.capacity() / MIN_BUDDY_SIZE;
+            // Integer.numberOfTrailingZeros()这个方法的作用是计算一个整数的二进制表示中，末尾有多少个连续的 0。
+            // 末尾有多少个0就代表是2的多少次方 这里这个值代表二叉树的层级或者是深度
             int maxShift = Integer.numberOfTrailingZeros(freeListCapacity);
             assert maxShift <= 30; // The top 2 bits are used for marking.
+            // 传-1表示先别急着分配大数组，先用小的，不够了再自动长大
             freeList = MpscIntQueue.create(freeListCapacity, -1); // At most half of tree (all leaf nodes) can be freed.
+            // 对于满二叉树 总节点数 = 2 × 叶子节点数 - 1
+            // 叶子节点数是512个,总结点数需要1023 这里分配1024  索引 0 通常不用，或者仅仅作为填充
             buddies = new byte[freeListCapacity << 1];
 
             // Generate the buddies entries.
@@ -1572,6 +1582,10 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        // AdaptiveByteBuf buf 需要被初始化的目标缓冲区对象
+        // size 请求大小
+        // startingCapacity 初始容量
+        // maxCapacity 最大容量
         @Override
         public boolean readInitInto(AdaptiveByteBuf buf, int size, int startingCapacity, int maxCapacity) {
             if (!freeList.isEmpty()) {

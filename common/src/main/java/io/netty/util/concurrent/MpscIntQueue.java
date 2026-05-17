@@ -116,6 +116,9 @@ public interface MpscIntQueue {
                 AtomicLongFieldUpdater.newUpdater(MpscAtomicIntegerArrayQueue.class, "producerLimit");
         private static final AtomicLongFieldUpdater<MpscAtomicIntegerArrayQueue> CONSUMER_INDEX =
                 AtomicLongFieldUpdater.newUpdater(MpscAtomicIntegerArrayQueue.class, "consumerIndex");
+        // 这个值是长度-1  长度固定为2的幂次方
+        // 按照长度是2的幂次方，mask为长度-1 index & mask  的值和index%length
+        // 对一个数取模2^n    那么结果就是这个数的低n位
         private final int mask;
         private final int emptyValue;
         private volatile long producerIndex;
