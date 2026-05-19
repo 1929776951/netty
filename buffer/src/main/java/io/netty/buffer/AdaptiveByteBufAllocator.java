@@ -31,6 +31,7 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         implements ByteBufAllocatorMetricProvider, ByteBufAllocatorMetric {
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(AdaptiveByteBufAllocator.class);
+    // 是否对于NioEventLoop线程使用缓存的magazines 默认false
     private static final boolean DEFAULT_USE_CACHED_MAGAZINES_FOR_NON_EVENT_LOOP_THREADS;
 
     static {

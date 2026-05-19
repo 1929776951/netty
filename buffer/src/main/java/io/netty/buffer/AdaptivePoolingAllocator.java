@@ -108,9 +108,10 @@ final class AdaptivePoolingAllocator {
     // 初始仓库数
     private static final int INITIAL_MAGAZINES = 1;
     // 退役容量
-    // 当一个内存块（Chunk）被切分得只剩下一点点空间（比如小于 256 字节）时，这个块就被认为“没用了”。
-    // 这时候，分配器不会保留这个只剩下 200 字节的碎片块，而是将其“退役”（释放回操作系统或全局池）。
+    // 如果系统瞬间出现高负载,分配了大量的内存chunk,随后负载骤降,这些chunk如果一直保留在内存池中，会白白占用操作系统内存
     private static final int RETIRE_CAPACITY = 256;
+    // 为了减少多线程环境下的锁竞争,采用了分片的机制，简单来说，Netty不会让所有线程都去抢同一块大内存池，而是创建了多个小的内存池
+    // 这里是控制数量
     private static final int MAX_STRIPES = IS_LOW_MEM ? 1 : NettyRuntime.availableProcessors() * 2;
     // 每个 Chunk 期望容纳大约 8 个缓冲区 为什么是 8？ 这是一个经验值。
     // 如果每个 Chunk 里塞太多 Buffer，管理起来太复杂；塞太少，内存碎片率又高。
@@ -125,7 +126,7 @@ final class AdaptivePoolingAllocator {
     private static final int MAX_CHUNK_SIZE = IS_LOW_MEM ?
             2 * 1024 * 1024 : // 2 MiB for systems with small heaps.
             8 * 1024 * 1024; // 8 MiB.
-    // 申请MAX_POOLED_BUF_SIZE以下 的内存，走自适应池化逻辑（复用）；申请 超过 1MB 的内存，直接走非池化逻辑（每次新建，用完即弃）。
+    // 申请MAX_POOLED_BUF_SIZE以下 的内存，走自适应池化逻辑（复用）
     private static final int MAX_POOLED_BUF_SIZE = MAX_CHUNK_SIZE / BUFS_PER_CHUNK;
 
     /**
@@ -221,8 +222,12 @@ final class AdaptivePoolingAllocator {
     private final ChunkAllocator chunkAllocator;
     // 它负责记录和追踪所有已经申请出来的 Chunk。
     private final ChunkRegistry chunkRegistry;
+    // 下面两个是全局共享的 中央仓库
+    // 尺寸类别类型的
     private final MagazineGroup[] sizeClassedMagazineGroups;
+    // 大缓存区的
     private final MagazineGroup largeBufferMagazineGroup;
+    // 这个是当前线程本地缓存的。
     private final FastThreadLocal<MagazineGroup[]> threadLocalGroup;
 
     AdaptivePoolingAllocator(ChunkAllocator chunkAllocator, boolean useCacheForNonEventLoopThreads) {
@@ -256,6 +261,7 @@ final class AdaptivePoolingAllocator {
     private static MagazineGroup[] createMagazineGroupSizeClasses(
             AdaptivePoolingAllocator allocator, boolean isThreadLocal) {
         MagazineGroup[] groups = new MagazineGroup[SIZE_CLASSES.length];
+        // 每个规格大小一个MagazineGroup
         for (int i = 0; i < SIZE_CLASSES.length; i++) {
             int segmentSize = SIZE_CLASSES[i];
             groups[i] = new MagazineGroup(allocator, allocator.chunkAllocator,
@@ -297,17 +303,21 @@ final class AdaptivePoolingAllocator {
         if (size <= MAX_POOLED_BUF_SIZE) {
             final int index = sizeClassIndexOf(size);
             MagazineGroup[] magazineGroups;
+            // 先从本地线程里面获取
             if (!FastThreadLocalThread.currentThreadWillCleanupFastThreadLocals() ||
                     IS_LOW_MEM ||
                     (magazineGroups = threadLocalGroup.get()) == null) {
                 magazineGroups =  sizeClassedMagazineGroups;
             }
+            // 如果申请的size大小在规格内有，则从对应的magazineGroups中获取对应的magazineGroup
             if (index < magazineGroups.length) {
                 allocated = magazineGroups[index].allocate(size, maxCapacity, currentThread, buf);
-            } else if (!IS_LOW_MEM) {
+            } else if (!IS_LOW_MEM) {// 如果index不再设定的规格内,且不是小内存,才走大内存分配
                 allocated = largeBufferMagazineGroup.allocate(size, maxCapacity, currentThread, buf);
             }
         }
+        // 如果上面不再设定的规格内，也不走大内存分配，走这里的备选方案分配
+        // fallback是后备方案
         if (allocated == null) {
             allocated = allocateFallback(size, maxCapacity, currentThread, buf);
         }
@@ -428,6 +438,17 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        // 如果是扩容操作reallocate，则传入旧的bug，如果是新分配，传入null
+        // 当长度是2的幂次方时,用threadId & mask，代替threadId % mask ，性能更高
+        // 当l = 2 ^ k 时  x mod l = x & (l -1)
+        //  一个数x 除以 2 ^1 余数就是最后一位
+        //                // 一个数x 除以 2 ^2 余数就是最后二位
+        //                //一个数x 除以 2 ^3 余数就是最后三位
+        //                //一个数x 除以 2 ^4 余数就是最后四位
+        //                //一个数x 除以 2 ^5 余数就是最后五位
+        //                // 要求余数 也即是求这个数的底幂次方位,
+        //                // 2幂次方的数有一个规律就是只有1个1，后面全是0，几次幂就是几个0
+        //                // 二2的幂次方-1 是几次幂就几个1  那么这两个数据按位与就是底几位(幂次方)
         public AdaptiveByteBuf allocate(int size, int maxCapacity, Thread currentThread, AdaptiveByteBuf buf) {
             boolean reallocate = buf != null;
 
@@ -445,14 +466,22 @@ final class AdaptivePoolingAllocator {
             // Path for concurrent allocation.
             long threadId = currentThread.getId();
             Magazine[] mags;
+            // 记录扩容的次数
             int expansions = 0;
             do {
                 mags = magazines;
                 int mask = mags.length - 1;
                 int index = (int) (threadId & mask);
+                // 为什么是2倍的长度,比如你到银行办业务，一共8个窗口，然后你应该去3好窗口，你到了3好窗口，发现有人在办业务，你不需要等待，直接
+                // 去4号、5号、6号、7号 ,0号 、1号、2号、3号、4号、5号、6号、7号、0号、1号、2号
+                // 循环两倍的长度，是为了增加尝试的次数，给予更多的机会去"碰运气"找到一个空闲。
+
+                // 同一个线程每次拿到的Magazine可能不一样 Netty的设计就是 只要能抢到内存，管它是哪个Magazine，谁空闲我就用谁
                 for (int i = 0, m = mags.length << 1; i < m; i++) {
                     Magazine mag = mags[index + i & mask];
+                    // 下面是先分配，在尝试 减小锁的粒度。
                     if (buf == null) {
+                        // 这里只拿到了 AdaptiveByteBuf的空对象，没有真正分配底层内存
                         buf = mag.newBuffer();
                     }
                     if (mag.tryAllocate(size, maxCapacity, buf, reallocate)) {
@@ -776,16 +805,23 @@ final class AdaptivePoolingAllocator {
         }
     }
 
+    // 该类是ChunkManagementStrategy策略的一个实现，这个是管理大内存的，还有一个是尺寸规格管理的策略
+    // 本类不是真正管理的，是创建真正管理的Chunk的controller和chunkCache两个组件的工厂类
+
     private static final class BuddyChunkManagementStrategy implements ChunkManagementStrategy {
         private final AtomicInteger maxChunkSize = new AtomicInteger();
 
+        // 负责创建一个BuddyChunkController
         @Override
         public ChunkController createController(MagazineGroup group) {
+            // 这个控制器是内存管理的"大脑",它内部会利用经典的Buddy System(伙伴算法)来管理内存的分配与回收
             return new BuddyChunkController(group, maxChunkSize);
         }
 
         @Override
         public ChunkCache createChunkCache(boolean isThreadLocal) {
+            // 这个缓存是内存管理的"仓库",用于存放空闲的、可供复用的内存块 这个使用的是跳表，确保在多线程环境下，对空闲内存块的查找、
+            // 插入和删除操作都能高效且线程安全完成
             return new ConcurrentSkipListChunkCache();
         }
     }
@@ -892,12 +928,15 @@ final class AdaptivePoolingAllocator {
 
         public boolean tryAllocate(int size, int maxCapacity, AdaptiveByteBuf buf, boolean reallocate) {
             if (allocationLock == null) {
+                // 没有锁 代表当前线程独享Magazine，不需要加锁，直接分配内存
+                // 只有 allocationLock被跨线程共享时才会被初始化
                 // This magazine is not shared across threads, just allocate directly.
                 return allocate(size, maxCapacity, buf, reallocate);
             }
 
             // Try to retrieve the lock and if successful allocate.
             long writeLock = allocationLock.tryWriteLock();
+            // 尝试获取一个写锁，如果成功，返回一个非0的锁句柄
             if (writeLock != 0) {
                 try {
                     return allocate(size, maxCapacity, buf, reallocate);
@@ -905,6 +944,7 @@ final class AdaptivePoolingAllocator {
                     allocationLock.unlockWrite(writeLock);
                 }
             }
+            // 如果拿不到锁，说明当前这个共享的Magazine正忙，具体看方法内部的逻辑。
             return allocateWithoutLock(size, maxCapacity, buf);
         }
 
@@ -1090,6 +1130,7 @@ final class AdaptivePoolingAllocator {
         public AdaptiveByteBuf newBuffer() {
             AdaptiveRecycler recycler = this.recycler;
             AdaptiveByteBuf buf = recycler == null? EVENT_LOOP_LOCAL_BUFFER_POOL.get() : recycler.get();
+            // 这里为什么只清理引用计数 和  markedReaderIndex  markedWriterIndex
             buf.resetRefCnt();
             buf.discardMarks();
             return buf;
@@ -1100,7 +1141,10 @@ final class AdaptivePoolingAllocator {
         }
     }
 
+    // Netty通过AdaptivePoolingAllocator分配的所有内存块的总量.它是一个全局的内存计数器
     private static final class ChunkRegistry {
+        // 用来存储已经分配出去的内存字节总数
+        // LongAdder转为解决AtomicLong在高并发场景下的性能瓶颈而设计。
         private final LongAdder totalCapacity = new LongAdder();
 
         public long totalCapacity() {
@@ -1745,6 +1789,7 @@ final class AdaptivePoolingAllocator {
 
         // this both act as adjustment and the start index for a free list segment allocation
         private int startIndex;
+        // 真正的ByteBuf
         private AbstractByteBuf rootParent;
         Chunk chunk;
         private int length;

@@ -95,6 +95,8 @@ public final class PlatformDependent {
 
     private static final Throwable UNSAFE_UNAVAILABILITY_CAUSE = unsafeUnavailabilityCause0();
     private static final boolean DIRECT_BUFFER_PREFERRED;
+    // explicit 显示地 明确的  prefer 优先 偏好
+    // 明确的不有限使用直接内存
     private static final boolean EXPLICIT_NO_PREFER_DIRECT;
     private static final long MAX_DIRECT_MEMORY = estimateMaxDirectMemory();
 
@@ -118,6 +120,7 @@ public final class PlatformDependent {
     private static final boolean IS_IVKVM_DOT_NET = isIkvmDotNet0();
 
     private static final int ADDRESS_SIZE = addressSize0();
+    // 用来记录Netty已经分配了多少直接内存
     private static final AtomicLong DIRECT_MEMORY_COUNTER;
     private static final long DIRECT_MEMORY_LIMIT;
     private static final Cleaner CLEANER;
@@ -183,6 +186,9 @@ public final class PlatformDependent {
         // * == 0  - Use cleaner, Netty will not enforce max memory, and instead will defer to JDK.
         // * >  0  - Don't use cleaner. This will limit Netty's total direct memory
         //           (note: that JDK's direct memory limit is independent of this).
+        // 小于0 不使用Cleaner(清理器) Netty放弃了自我限制,直接沿用了JDK的默认规则,默认通常等于Xmx，实际的Java进程占用的内存可能达到Xmx的两倍
+        // 等于0 使用Cleaner，Netty将不强制限制最大内存
+        // 大于0 不使用Cleaner 这将限制Netty的总直接内存使用量(注意:JDK自身的直接内存限制与此设置相互独立)
         long maxDirectMemory = SystemPropertyUtil.getLong("io.netty.maxDirectMemory", -1);
 
         // Initialize the direct memory counter independently of Unsafe availability,
@@ -237,7 +243,7 @@ public final class PlatformDependent {
         } else {
             CLEANER = LEGACY_CLEANER;
         }
-
+        // 明确的不有限使用直接内存的值默认为false，也就是默认优先使用直接内存
         EXPLICIT_NO_PREFER_DIRECT = SystemPropertyUtil.getBoolean("io.netty.noPreferDirect", false);
         // We should always prefer direct buffers by default if we can use a Cleaner to release direct buffers.
         DIRECT_BUFFER_PREFERRED = CLEANER != NOOP

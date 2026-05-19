@@ -23,6 +23,8 @@ public interface ByteBufAllocator {
 
     ByteBufAllocator DEFAULT = ByteBufUtil.DEFAULT_ALLOCATOR;
 
+    // 用于分配通用用途的内存 用于一般业务逻辑处理，比如你在代码里临时拼凑一个字符串，或者处理一些不需要直接发送到网卡的中间数据
+    // 三个重载方法
     /**
      * Allocate a {@link ByteBuf}. If it is a direct or heap buffer
      * depends on the actual implementation.
@@ -45,6 +47,7 @@ public interface ByteBufAllocator {
     /**
      * Allocate a {@link ByteBuf}, preferably a direct buffer which is suitable for I/O.
      */
+    //
     ByteBuf ioBuffer();
 
     /**

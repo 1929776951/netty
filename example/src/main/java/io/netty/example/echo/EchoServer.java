@@ -30,6 +30,11 @@ import io.netty.example.util.ServerUtil;
 import io.netty.handler.logging.LogLevel;
 import io.netty.handler.logging.LoggingHandler;
 import io.netty.handler.ssl.SslContext;
+import io.netty.util.internal.LongLongHashMap;
+import io.netty.util.internal.MathUtil;
+
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * Echoes back any received data from a client.
@@ -40,7 +45,11 @@ public final class EchoServer {
 
     public static void main(String[] args) throws Exception {
 
-        String str = ByteBufUtil.hexDump("我是中国人".getBytes());
+       int index = 3;
+       for(int i = 0;i<16;i++){
+           System.out.println(index + i & 7);
+       }
+
 
 
         // Configure SSL.
