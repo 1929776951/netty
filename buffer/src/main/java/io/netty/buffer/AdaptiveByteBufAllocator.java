@@ -88,6 +88,12 @@ public final class AdaptiveByteBufAllocator extends AbstractByteBufAllocator
         return this;
     }
 
+    // 这个类不放到AdaptivePoolingAllocator类面，而是放到AdaptiveByteBufAllocator这个类里面，具体原因是什么？
+    // 如果这个HeapChunkAllocator类只在当前外部类中被实例化和使用，那么将它们放在这里是符合逻辑的。这表明"这是属于这个类的私有实现细节",
+    // 而不是一个可以被全局共享的通用组件。
+    //  定义为外部类内部且为private,意味着外部世界，包括AdaptivePoolingAllocator这个类本身，完全不知道者两个具体实现的存在。他们只
+    // 暴露ChunkAllocator这个接口行为。
+    // 还可以防止其他代码直接依赖这两个具体的实现类，强制他们只依赖接口。
     private static final class HeapChunkAllocator implements AdaptivePoolingAllocator.ChunkAllocator {
         private final ByteBufAllocator allocator;
 

@@ -1003,14 +1003,17 @@ final class AdaptivePoolingAllocator {
             }
 
             assert current == null;
-            // The fast-path for allocations did not work.
+            // The fast-path for allocations did not work. 快速路径失败了，才走到这里
             //
             // Try to fetch the next "Magazine local" Chunk first, if this fails because we don't have a
+            // 先看可能有没有"预备"好的本地内存块
             // next-in-line chunk available, we will poll our centralQueue.
             // If this fails as well we will just allocate a new Chunk.
             //
             // In any case we will store the Chunk as the current so it will be used again for the next allocation and
             // thus be "reserved" by this Magazine for exclusive usage.
+            // 如果是线程独占的Magazine的话，这个magazine里面的NEXT_IN_LINE值不能是MAGAZINE_FREED
+            // 如果是独占的Magazine的话，那么它绝对不会在分配过程中被别的线程或者缩容或迁移，也就不会是这个值MAGAZINE_FREED
             curr = NEXT_IN_LINE.getAndSet(this, null);
             if (curr != null) {
                 if (curr == MAGAZINE_FREED) {
@@ -1021,6 +1024,7 @@ final class AdaptivePoolingAllocator {
 
                 int remainingCapacity = curr.remainingCapacity();
                 if (remainingCapacity > startingCapacity &&
+                        // 这里如果remainingCapacity > startingCapacity为true，那这个readInitInto一定要为true
                         curr.readInitInto(buf, size, startingCapacity, maxCapacity)) {
                     // We have a Chunk that has some space left.
                     current = curr;
