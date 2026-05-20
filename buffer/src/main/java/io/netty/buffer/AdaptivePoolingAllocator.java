@@ -1022,7 +1022,10 @@ final class AdaptivePoolingAllocator {
                     return false;
                 }
 
+
+
                 int remainingCapacity = curr.remainingCapacity();
+                // 1剩余空间充足,还可以保留当前chunk给到current，留给下次用
                 if (remainingCapacity > startingCapacity &&
                         // 这里如果remainingCapacity > startingCapacity为true，那这个readInitInto一定要为true
                         curr.readInitInto(buf, size, startingCapacity, maxCapacity)) {
@@ -1031,7 +1034,20 @@ final class AdaptivePoolingAllocator {
                     return true;
                 }
 
+                // 这里在判断一次remainingCapacity > =size 是因为 startingCapacity的计算方式在SizeClassChunkController中取的是
+                // segmentSize的大小，在BuddyChunkController中是取的请求大小的下一个2的幂次方的大小，所以这个可能
+                // remainingCapacity 是在startingCapacity和size之间的 即 size <= remainingCapacity <=startingCapacity
                 try {
+                    // 2剩余空间刚够本次，但不足以留给下次复用 分配完成后就把当前chunk释放掉了，这里的释放是让当前chunk和magazine不再关联
+                    // 让magazine不再持有这个chunk，因为它目前已经没有可用空间了。
+                    // 为什么不等待"可能的释放" 比如这次申请没有，下次申请之前，可能有内存释放
+                    // 1、magazine没有监听机制，无法感知有内存被释放了，如果不剥离这个chunk，它会一直占用magazine的位置，但剩余空间有不足，
+                    // 反而拖慢了后续分配速度。
+                    // 2、即使中间有内存被释放，这些释放的空间也是碎片化的，可能分散在chunk的不同位置。要复用这些碎片，
+                    // 需要扫描chunk的空闲列表，合并相邻的空闲块，这一套操作成本很高，会破化 threadLocal分配路径的"无锁、速度、恒定时间"的
+                    // 性能承诺.
+                    // 3、全局池才是处理碎片的地方。本地线程的magazine需要保证，一旦chunk变碎片到无法分配，就还给全局池，换一个新的、
+                    // 完整的chunk过来
                     if (remainingCapacity >= size) {
                         // At this point we know that this will be the last time curr will be used, so directly set it
                         // to null and release it once we are done.
@@ -1040,6 +1056,7 @@ final class AdaptivePoolingAllocator {
                 } finally {
                     // Release in a finally block so even if readInitInto(...) would throw we would still correctly
                     // release the current chunk before null it out.
+                    // 这个方法会剥离chunk和magazine的关联，并将chunk放入全局池子
                     curr.releaseFromMagazine();
                 }
             }
