@@ -71,14 +71,23 @@ public abstract class Recycler<T> {
             }
         }
     }
-
+    // 当某个对象不应当被回收或者回收功能被禁用时，系统会分配这个句柄给对象。当用户调用这个句柄的recycle()(回收)方法时，它什么都不做。避免
+    // 了在代码中频繁的null值检查。
     private static final EnhancedHandle<?> NOOP_HANDLE = new LocalPoolHandle<>(null);
+    // 容量为0的本地池,它用于在对象池被禁用或不可用的情况下作为占位符。既然容量为0，意味者无法存储任何对象，任何放入其中的对象都不会被立即丢弃。
     private static final UnguardedLocalPool<?> NOOP_LOCAL_POOL = new UnguardedLocalPool<>(0);
+    // 定义了每个线程的对象池默认初始容量。 Netty的Recycler时基于threadLocal的，每个线程都有自己独立的对象池(栈)。
     private static final int DEFAULT_INITIAL_MAX_CAPACITY_PER_THREAD = 4 * 1024; // Use 4k instances as default.
+    // 每个线程池
     private static final int DEFAULT_MAX_CAPACITY_PER_THREAD;
+    // 采样比率,用于控制对象池的创建频率 由于Recycler是基于ThreadLocal的，如果创建过多的线程(如虚拟线程或大量普通线程),每个线程都维护一个池子
+    // 可能会消耗过多内存。这个比率通常用于决定是否为某个线程分配真正的池子，或者使用容量为0的NOOP_LOCAL_POOL
     private static final int RATIO;
+    // 定义了每个线程的池子内部队列的"块"大小
     private static final int DEFAULT_QUEUE_CHUNK_SIZE_PER_THREAD;
+    // 标志位，用于指示是否使用"阻塞式"对象池
     private static final boolean BLOCKING_POOL;
+    // 如果开启，可能意味着在某些批处理场景下，只使用FastThreadLocal优化的路径，而不回退到标准的JDK ThreadLocal，以获得极致的性能。
     private static final boolean BATCH_FAST_TL_ONLY;
 
     static {
@@ -97,9 +106,13 @@ public abstract class Recycler<T> {
         // By default, we allow one push to a Recycler for each 8th try on handles that were never recycled before.
         // This should help to slowly increase the capacity of the recycler while not be too sensitive to allocation
         // bursts.
+        // 每尝试回收8次，才真正允许1个对象进入池中
+        // 为什么要这样做，1、避免过度缓存，高并发下，如果所有有用的对象都立刻放回池子，池子会瞬间爆满，且很多对象可能马上就不再被使用了。
+        // 2、平滑扩容，这有助于让池子的容量缓慢增长，而不是对突发的分配请求过于敏感。
         RATIO = max(0, SystemPropertyUtil.getInt("io.netty.recycler.ratio", 8));
-
+        // 控制当对象池满了或者获取对象时的行为。
         BLOCKING_POOL = SystemPropertyUtil.getBoolean("io.netty.recycler.blocking", false);
+
         BATCH_FAST_TL_ONLY = SystemPropertyUtil.getBoolean("io.netty.recycler.batchFastThreadLocalOnly", true);
 
         if (logger.isDebugEnabled()) {
@@ -133,6 +146,10 @@ public abstract class Recycler<T> {
      * recycled and assume no other recycling happens concurrently
      * (similar to what {@link EnhancedHandle#unguardedRecycle(Object)} does).<br>
      */
+    // 小心使用，这个构造器创建的是一个可以被多个线程并发调用的共享Recycler，
+    // UnguardedLocalPool 无保护模式，它在回收对象时不检查该对象是否真的属于这个池子，也不检查是否有其他线程正在并发修改。它假设调用者是
+    // 诚实 且聪明的。
+    // 风险 如果一个对象被错误地回收了两次，或者在不安全的情况下被回收，可能会导致数据损坏或程序崩溃。
     protected Recycler(int maxCapacity, boolean unguarded) {
         if (maxCapacity <= 0) {
             maxCapacity = 0;
@@ -176,6 +193,13 @@ public abstract class Recycler<T> {
         this(maxCapacityPerThread, RATIO, DEFAULT_QUEUE_CHUNK_SIZE_PER_THREAD);
     }
 
+    /**
+     * 大部分使用的都是这个无参构造方法
+     * 最终调用的构造方法是private Recycler(int maxCapacityPerThread, int ratio, int chunkSize, boolean useThreadLocalStorage,
+     *                      Thread owner, boolean unguarded) {
+     *    具体说明查看最终调用的构造方法
+     *
+     */
     protected Recycler() {
         this(DEFAULT_MAX_CAPACITY_PER_THREAD);
     }
@@ -255,6 +279,19 @@ public abstract class Recycler<T> {
         this(maxCapacityPerThread, interval, chunkSize, false, owner, unguarded);
     }
 
+    /**
+     * useThreadLocalStorage 大部分情况下是调用的无参构造方法，调到这里时这个变量时true
+     *  owner是null
+     *  maxCapacityPerThread 默认值 大于0
+     *  两种使用模式
+     *  1、多线程共享Recycler实例 内部应该使用的是threadLocalPool 每个线程有自己的LocalPool 操作LocalPool 无并发问题
+     *  2、单线程使用Recycler实例，内部应该使用的是LocalPool，但是owner为指定的线程。
+     *  不能说单线程使用，但是owner不给值
+     *  也不能说多线程共享Recycler，但是条件走的是使用LocalPool
+     *
+     *
+     */
+
     @SuppressWarnings("unchecked")
     private Recycler(int maxCapacityPerThread, int ratio, int chunkSize, boolean useThreadLocalStorage,
                      Thread owner, boolean unguarded) {
@@ -302,6 +339,8 @@ public abstract class Recycler<T> {
 
     @SuppressWarnings("unchecked")
     public final T get() {
+        // 如果这个localPool不为空，说明是单线程独占这个Recycler. 单线程使用的时候用户一定要在指定的线程中调用get方法，
+        // 不能说Recycler是线程A的，要在B线程使用这个Recycler对象。
         if (localPool != null) {
             return localPool.getWith(this);
         } else {
@@ -497,10 +536,16 @@ public abstract class Recycler<T> {
 
     private abstract static class LocalPool<H, T> {
         private final int ratioInterval;
+        // 这是一个临时缓冲区(数组)。当从池中获取对象时，为了提高效率，Netty会一次性从底层队列pooledHandles中抓取一批对象
+        // 比如抓取32个,存入这个batch数组中。下次再要对象时，直接从数组里取，避免频繁操作并发队列。
         private final H[] batch;
+        // 记录当前batch数据里还剩余多少个可用对象。
         private int batchSize;
+        // 标记这个池子是属于哪个线程。如果是线程本地池，owner就是当前线程；如果是共享池，owner可能是null。这用于判断是否需要加锁或进行线程安全检查
         private Thread owner;
+        // 核心队列，这是真正的"仓库"，所有被回收的句柄最终都会存储在这个队列中
         private MessagePassingQueue<H> pooledHandles;
+        // 计数器，配合ratioInterval使用。每调用一次回收，计数器加1，当计数器达到ratioInterval时，触发真正的入队操作并重置计数器。
         private int ratioCounter;
 
         LocalPool(int maxCapacity) {
@@ -550,9 +595,24 @@ public abstract class Recycler<T> {
                          ? Thread.currentThread() : null, maxCapacity, ratioInterval, chunkSize);
         }
 
+        // 这个方法不会存在并发 因为当前的LocalPool一定是属于某一个线程的。具体查看Recycler构造方法上的注释
+        // LocalPool本身不是线程安全的，但它的访问被严格限制在单线程，要么是threadLocal模式下的调用线程自己的本地
+        // 要么是localPool模式下的 绑定的owner的线程。
         protected final H acquire() {
+            // 先判断当前数组是不是为空。
             int size = batchSize;
             if (size == 0) {
+                // 这里按道理LocalPool是线程独占的，pooledHandles也应该是独占的，为什么会有并发问题呢，这里的并发问题不是acquire()方法被多线程
+                // 调用,而是指pooledHandles被多线程操作，那谁在操作呢，有两类线程操作，1、独占当前LocalPool的线程，2 其他线程，主要在执行
+                // release操作时，因为不是独占的那个线程，会把对象relaxedOffer到这个队列。 还有一个线程销毁逻辑中onRemoval会把pooledHandles
+                // 清空并赋值为null
+                // 当其他线程把pooledHandles赋值为null时，独占的那个线程还未看到，即便读取到旧对立的引用，relaxedPoll 最多返回空或者
+                // 复用一个不会再回收的对象，不影响程序的正确性
+                // 为什么会有"复用一个不会再会回收的对象"这种对象
+                // 假设polledHandles = null，还未来得及handles.clear，独占的那个线程在这个间隙读到了旧的队列引用，调用relaxedPoll()
+                // 拿到了队列的一个对象， 队列别销毁了，这个对象没有办法再放回队列了，可以回到batch，但是回到batch的条件时owner不为空，因为队列被销毁时
+                // 先执行polledHandles = null 再执行owner=null，所以没办法回batch了也。
+                // 如果再owner=null 之前就release，还是会回到batch中的，那么就正在复用就行了。
                 // it's ok to be racy; at worst we reuse something that won't return back to the pool
                 final MessagePassingQueue<H> handles = pooledHandles;
                 if (handles == null) {
@@ -560,6 +620,7 @@ public abstract class Recycler<T> {
                 }
                 return handles.relaxedPoll();
             }
+            // 数组不为空，获取数组最后的元素
             int top = size - 1;
             final H h = batch[top];
             batchSize = top;
@@ -568,14 +629,19 @@ public abstract class Recycler<T> {
         }
 
         protected final void release(H handle) {
+            // 能回到batch的条件一定时owner线程不为空，且当前线程为owner。
             Thread owner = this.owner;
             if (owner != null && Thread.currentThread() == owner && batchSize < batch.length) {
                 batch[batchSize] = handle;
                 batchSize++;
+                // owner不为空，但是owner已经Terminated状态。
             } else if (owner != null && isTerminated(owner)) {
                 pooledHandles = null;
                 this.owner = null;
             } else {
+                // 如果a线程，也是owner线程 调用release方法，进入到(owner != null && isTerminated(owner)) 这个逻辑了，将
+                // owner = null 那此时另一个线程b调用release方法，进来就会判断owner是null，进入到当前这个分支，然后会将对象释放到
+                // pooledHandles这个线程。
                 MessagePassingQueue<H> handles = pooledHandles;
                 if (handles != null) {
                     handles.relaxedOffer(handle);
