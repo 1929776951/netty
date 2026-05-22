@@ -1064,6 +1064,7 @@ final class AdaptivePoolingAllocator {
             }
 
             // Now try to poll from the central queue first
+            // 尝试从中央队列中获取
             curr = group.pollChunk(size);
             if (curr == null) {
                 curr = chunkController.newChunkAllocation(size, this);
