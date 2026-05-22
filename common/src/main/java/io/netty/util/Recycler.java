@@ -412,7 +412,9 @@ public abstract class Recycler<T> {
     }
 
     private static final class DefaultHandle<T> extends EnhancedHandle<T> {
+        // 已被认领(正在使用中，不可回收)
         private static final int STATE_CLAIMED = 0;
+        // 可用(已回收,可再次被认领)
         private static final int STATE_AVAILABLE = 1;
         private static final AtomicIntegerFieldUpdater<DefaultHandle<?>> STATE_UPDATER;
         static {
@@ -421,6 +423,7 @@ public abstract class Recycler<T> {
             STATE_UPDATER = (AtomicIntegerFieldUpdater<DefaultHandle<?>>) updater;
         }
 
+        // 刚创建的对象正在被使用
         private volatile int state; // State is initialised to STATE_CLAIMED (aka. 0) so they can be released.
         private final GuardedLocalPool<T> localPool;
         private T value;
@@ -447,8 +450,25 @@ public abstract class Recycler<T> {
             localPool.release(this);
         }
 
+
+        // 按道理LocalPool是threadLocal的，保证池子本身不会被多线程竞争，一个线程有一个自己的池子，但是池子里的Handler一旦被业务代码带出线程
+        // 传递给多个线程拥有时，可能出现多个线程同时认领，就会出现重复认领 recycle时出现重复回收。
+        // 其实实际情况时不允许这么用的，比如我一个线程A 拿到了handler，我接着调用claim认领，我成功做业务，我干嘛要把这个handler传递给B线程
+        // 即便传给了B线程，B线程claim时直接抛出异常了，那岂不是B线程业务就断了，这样是没有意义的，没人会这么设置，
+        // 正常，规范的业务代码，根本就不应该把A线程认领的Handle对象传给B线程使用。Netty不鼓励、不允许你这么干。
+        // 非要多线程中这么用，出了问题要自己解决了
         T claim() {
             assert state == STATE_AVAILABLE;
+            // 这里使用lazySet操作，有一种这种情况，假设就handle传递给了A B两个线程，那么A 判断可用，然后lazySet这个状态，因为是Lazy，B线程
+            // 看到的还是可用，那么这里其实是防不住并发的，那这里用LazySet的意义又在哪里呢
+            // 其实这里的lazySet是防止同一个线程多次调用，考虑这样一种情况
+            // 你刚拿到value返回给业务，业务还没有用，立刻调用recycle回收，此时state还是AVAILABLE,toAvailable()再次把它改成AVAILABLE
+            // 那就会重复回收。如果不使用这个lazySet，而是用普通的赋值，那jvm可能会重排序，比如先return value 再执行普通赋值操作
+            // 这样一个线程A 认领--》拿到值--》普通赋值
+            // claim(),紧接着调用recycle()   那么顺序可能是 assert state == STATE_AVAILABLE;
+            // ---》recycle方法中的toAvailable()--》claim方法中的赋值操作，这样乱序就有问题啦
+            // 如果用lazySet 顺序 严格是 认领-》lazySet-》return value--》recycle()方法，这样书讯就严格被控制主了 不会重排序了。
+            // lazySet只是不能保证多个线程的可见，但在当前线程内，是可见的。这里主要是要保证顺序性。先改状态，再返回对象。
             STATE_UPDATER.lazySet(this, STATE_CLAIMED);
             return value;
         }
@@ -457,6 +477,9 @@ public abstract class Recycler<T> {
             this.value = value;
         }
 
+        // 这里一定是要将对象状态改为AVAILABLE的，因为这个方法只给recycler调用，我先将状态更新，如果你之前的状态不对 我就抛异常(重复回收了)，
+        // 让上层去处理，可能使用的不合理
+        // 如果之前的状态是认领，那更新为可用，没问题就不抛出异常，正常执行。
         private void toAvailable() {
             int prev = STATE_UPDATER.getAndSet(this, STATE_AVAILABLE);
             if (prev == STATE_AVAILABLE) {

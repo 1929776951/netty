@@ -312,7 +312,7 @@ final class AdaptivePoolingAllocator {
             // 如果申请的size大小在规格内有，则从对应的magazineGroups中获取对应的magazineGroup
             if (index < magazineGroups.length) {
                 allocated = magazineGroups[index].allocate(size, maxCapacity, currentThread, buf);
-            } else if (!IS_LOW_MEM) {// 如果index不再设定的规格内,且不是小内存,才走大内存分配
+            } else if (!IS_LOW_MEM) {// 如果index不在设定的规格内,且不是小内存,才走大内存分配
                 allocated = largeBufferMagazineGroup.allocate(size, maxCapacity, currentThread, buf);
             }
         }
@@ -896,6 +896,8 @@ final class AdaptivePoolingAllocator {
             }
         }
 
+        // 这个是专门给EVENT_LOOP线程使用的，是单线程操作的，所以是安全的，里面的unguarded可以设置为true 即无保护的
+        // 如果这个变量被用到的多线程中同时使用 就会出现问题。
         private static final AdaptiveRecycler EVENT_LOOP_LOCAL_BUFFER_POOL = AdaptiveRecycler.threadLocal();
 
         // 当前正在使用的内存块

@@ -78,8 +78,10 @@ public final class ChannelOutboundBuffer {
     // The Entry that is the first in the linked-list structure that was flushed
     private Entry flushedEntry;
     // The Entry which is the first unflushed in the linked-list structure
+    // 该指针指向ChannelOutBoundBuffer中第一个待发送数据的Entry
     private Entry unflushedEntry;
     // The Entry which represents the tail of the buffer
+    // 该指针指向ChannelOutBoundBuffer中最后一个待发送数据的Entry，通过unflushedEntry和tailEntry我们可以很容易定位待发送数据范围
     private Entry tailEntry;
     // The number of flushed entries that are not written yet
     private int flushed;
@@ -92,6 +94,7 @@ public final class ChannelOutboundBuffer {
     private static final AtomicLongFieldUpdater<ChannelOutboundBuffer> TOTAL_PENDING_SIZE_UPDATER =
             AtomicLongFieldUpdater.newUpdater(ChannelOutboundBuffer.class, "totalPendingSize");
 
+    // ChannelOutboundBuffer中的待发送数据的内存占用总量
     @SuppressWarnings("UnusedDeclaration")
     private volatile long totalPendingSize;
 
@@ -833,12 +836,24 @@ public final class ChannelOutboundBuffer {
 
         private final EnhancedHandle<Entry> handle;
         Entry next;
+        // 待发送数据
         Object msg;
         ByteBuffer[] bufs;
         ByteBuffer buf;
+        // 异步write操作的future
         ChannelPromise promise;
+        // 已发送了多少
         long progress;
+        // 总共要发送多少  不包括entry的大小
         long total;
+        // 当由于网络拥塞或者Netty客户端负载很高导致网络数据的接收速度以及处理速度越来越慢，TCP的滑动窗口不断缩小以减少网络数据的发送直到为0，
+        // 而Netty却又大量频繁的写操作，不断的写入到ChannelOutboundBuffer中。 这样就导致数据发送不出去，但是Netty服务端又在不停的写数据
+        //慢慢的就会撑爆ChannelOutboundBuffer，导致OOM，所以Netty就必须限制ChannelOutboundBuffer中的待发送数据的内存占用总量，不能
+        // 让它无线增长。Netty中定义了高低水位线用来表示ChannelOutboundBuffer中的待发送数据的内存占用量的上限和下限。这里的内存即包括
+        // JVM堆内存占用也包括堆外内存占用。
+        // 当待发送数据的内存占用总量超过高水位线的时候，Netty就会将NioSocketChannel的状态标记为不可写状态。否则可能导致OOM
+        // 当待发送数据的内存占用总量低于低水位线的时候，Netty会再次将NioSocketChannel的状态标记为可写状态。
+        // 这个字段计算的是待发送数据和Entry实例占用内存两部分。因为会有大量的Entry，所以这部分内存不可忽略
         int pendingSize;
         int count = -1;
         boolean cancelled;
