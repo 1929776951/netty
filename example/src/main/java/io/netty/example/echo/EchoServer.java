@@ -45,12 +45,6 @@ public final class EchoServer {
 
     public static void main(String[] args) throws Exception {
 
-       int index = 3;
-       for(int i = 0;i<16;i++){
-           System.out.println(index + i & 7);
-       }
-
-
 
         // Configure SSL.
         final SslContext sslCtx = ServerUtil.buildSslContext();

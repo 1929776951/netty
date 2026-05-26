@@ -87,6 +87,7 @@ public class ChannelOption<T> extends AbstractConstant<ChannelOption<T>> {
 
     public static final ChannelOption<MessageSizeEstimator> MESSAGE_SIZE_ESTIMATOR = valueOf("MESSAGE_SIZE_ESTIMATOR");
 
+    //
     public static final ChannelOption<Integer> CONNECT_TIMEOUT_MILLIS = valueOf("CONNECT_TIMEOUT_MILLIS");
     /**
      * @deprecated Use {@link MaxMessagesRecvByteBufAllocator}
@@ -117,15 +118,22 @@ public class ChannelOption<T> extends AbstractConstant<ChannelOption<T>> {
      * If {@code true} then the {@link Channel} is closed automatically and immediately on write failure.
      * The default value is {@code true}.
      */
+    // 当写入操作完成后，释放自动关闭channel。默认为true，适用于一次性通信场景
     public static final ChannelOption<Boolean> AUTO_CLOSE = valueOf("AUTO_CLOSE");
 
     public static final ChannelOption<Boolean> SO_BROADCAST = valueOf("SO_BROADCAST");
     public static final ChannelOption<Boolean> SO_KEEPALIVE = valueOf("SO_KEEPALIVE");
+    // 设置发送缓存区大小，增大可提升吞吐量。传输文件可以适当调大
     public static final ChannelOption<Integer> SO_SNDBUF = valueOf("SO_SNDBUF");
+    // 设置接收缓冲区大小，增大可减少丢包。
     public static final ChannelOption<Integer> SO_RCVBUF = valueOf("SO_RCVBUF");
+    // 允许绑定到仍处于TIME_WAIT状态的端口，常用于服务重启后快速回复监听。
     public static final ChannelOption<Boolean> SO_REUSEADDR = valueOf("SO_REUSEADDR");
+    // 控制close时的行为，设置未0表示立即关闭并丢弃未发送数据 设置未正整数表示等待指定秒数再关闭，设置为-1(默认)表示由系统决定
+    // 常用于需要确保数据完整发送的场景。
     public static final ChannelOption<Integer> SO_LINGER = valueOf("SO_LINGER");
     public static final ChannelOption<Integer> SO_BACKLOG = valueOf("SO_BACKLOG");
+    // 设置socket读写操作的超时时间(ms)，超过时间未操作则抛出SocketTimeoutException。
     public static final ChannelOption<Integer> SO_TIMEOUT = valueOf("SO_TIMEOUT");
 
     public static final ChannelOption<Integer> IP_TOS = valueOf("IP_TOS");
