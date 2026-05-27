@@ -1,10 +1,5 @@
-package io.netty.example.echo;
+package io.netty.example.demo;
 
-import io.netty.channel.ChannelOutboundBuffer;
-import io.netty.channel.DefaultChannelPipeline;
-import io.netty.channel.EventLoopGroup;
-import io.netty.channel.MultiThreadIoEventLoopGroup;
-import io.netty.channel.nio.NioIoHandler;
 import org.openjdk.jol.info.ClassLayout;
 import org.openjdk.jol.info.GraphLayout;
 import org.openjdk.jol.vm.VM;
