@@ -24,6 +24,10 @@ import java.util.concurrent.TimeUnit;
  * Besides this, it also extends the {@link EventExecutorGroup} to allow for a generic
  * way to access methods.
  */
+// 这个类继承EventExecutorGroup，是为了复用其接口契约，它具体实现的next()，等这些方法，不是像EventExecutorGroup这个的实现一样从多个
+//EventExecutor里面选择一个，而是next()方法返回自己。
+// 为什么这么设计 让EventExecutor和EventExecutorGroup对外暴露相同的接口，方便上层代码调用。无需区分是单个执行器，还是执行器组
+//  EventExecutor 继承EventExecutorGroup是一种接口复用+自身设计，它拥有所有管理功能，但这些管理功能的作用域是"自身"，而非"多个子执行器"
 public interface EventExecutor extends EventExecutorGroup, ThreadAwareExecutor {
 
     /**

@@ -24,6 +24,7 @@ import io.netty.util.concurrent.OrderedEventExecutor;
  * implementation details and internals.
  *
  */
+// EventLoop也继承了EventLoopGroup接口，可以看作是 只有自己一个成员的组，所以eventLoop也能当作组来使用，保持API一致性
 public interface EventLoop extends OrderedEventExecutor, EventLoopGroup {
     @Override
     EventLoopGroup parent();

@@ -20,6 +20,10 @@ import io.netty.util.concurrent.Future;
 /**
  * {@link EventLoopGroup} for {@link IoEventLoop}s.
  */
+// 专门设计这个IoEventLoopGroup 是为了职责分离   EventLoopGroup是通用接口
+    // 当前类是专用接口，只针对I/O事件场景
+    // Netty支持多种底层I/O模型 NIO Epoll(Linux专属) KQueue(BSD/macOS专属) IO_Uring(Linux5.1+最新异步I/O)
+    // 此接口作为顶层抽象，让不同I/O模式的实现类可以统一对外暴露，同时通过isCompatible和isIoType来约束各种的适用范围
 public interface IoEventLoopGroup extends EventLoopGroup {
 
     @Override

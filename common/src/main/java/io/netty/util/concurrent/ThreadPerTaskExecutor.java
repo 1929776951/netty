@@ -20,6 +20,9 @@ import io.netty.util.internal.ObjectUtil;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ThreadFactory;
 
+// 这个线程池 是极简的一个线程池实现，没有线程复用、队列、拒绝策略等复杂逻辑
+// 核心实现就是你来一个任务 我启动一个线程来处理任务，不适用什么队列，复用线程等。
+// 为每一个提交的任务，都单独创建并启动一个新线程来执行。
 public final class ThreadPerTaskExecutor implements Executor {
     private final ThreadFactory threadFactory;
 

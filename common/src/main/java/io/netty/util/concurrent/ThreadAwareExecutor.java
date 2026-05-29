@@ -20,6 +20,8 @@ import java.util.concurrent.Executor;
 /**
  * Executor that is aware its execution thread.
  */
+// 让执行器具备"感知自身工作线程"的能力。方便在代码中判断当前线程是否属于该执行器。
+// 在netty等异步框架中，经常需要判断 当前代码是否运行在指定执行器的工作线程上？某个线程是否由该执行器管理？
 public interface ThreadAwareExecutor extends Executor {
     /**
      * Return {@code true} if the given {@link Thread} is used by this {@link ThreadAwareExecutor} to execute

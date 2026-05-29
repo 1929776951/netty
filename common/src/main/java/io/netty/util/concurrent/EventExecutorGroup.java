@@ -27,6 +27,11 @@ import java.util.concurrent.TimeUnit;
  * life-cycle and allows shutting them down in a global fashion.
  *
  */
+// 是一个管理EventExecutor的组 有一些管理的功能
+// isShuttingDown 判断组里面的所有EventExecutor是不是都是正在关闭，具体判断逻辑可以查看实现类
+// shutdownGracefully优雅关闭组里面的所有 EventExecutor
+// terminationFuture  提供监听关闭所有EventExecutor事件的Future<?>
+// 除了管理功能，还有一些submit方法和周期执行方法，在这些方法都是调用所管理的EventExecutor执行的
 public interface EventExecutorGroup extends ScheduledExecutorService, Iterable<EventExecutor> {
 
     /**

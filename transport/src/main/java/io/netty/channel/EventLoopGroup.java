@@ -22,6 +22,7 @@ import io.netty.util.concurrent.EventExecutorGroup;
  * processed for later selection during the event loop.
  *
  */
+// EventLoopGroup是 Netty对EventExecutorGroup的业务定制,只新增和Netty网络编程强相关的能力。
 public interface EventLoopGroup extends EventExecutorGroup {
     /**
      * Return the next {@link EventLoop} to use
