@@ -42,13 +42,13 @@ import static java.lang.Math.min;
 
 /**
  * (Transport implementors only) an internal data structure used by {@link AbstractChannel} to store its pending
- * outbound write requests.
+ * outbound write requests. 一个内部的数据结构，即仅对传输层实现者暴露的内部 API普通业务开发无需直接交互。
  * <p>
  * All methods must be called by a transport implementation from an I/O thread, except the following ones:
- * <ul>
+ * <ul> 几乎所有方法必须由I/O 线程调用（保证并发安全）
  * <li>{@link #isWritable()}</li>
  * <li>{@link #getUserDefinedWritability(int)} and {@link #setUserDefinedWritability(int, boolean)}</li>
- * </ul>
+ * </ul> 这些方法可能允许非 I/O 线程访问（需结合源码理解其线程安全设计）。
  * </p>
  */
 public final class ChannelOutboundBuffer {
