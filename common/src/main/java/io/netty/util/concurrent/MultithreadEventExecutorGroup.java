@@ -60,6 +60,20 @@ public abstract class MultithreadEventExecutorGroup extends AbstractEventExecuto
      * @param executor          the Executor to use, or {@code null} if the default should be used.
      * @param args              arguments which will passed to each {@link #newChild(Executor, Object...)} call
      */
+    // 这个构造器中的入参Executor 是Netty用来创建和管理EventExecutor线程的底层执行器
+    // 1、提供线程执行的底层能力 它本质是一个java.util.concurrent.Executor 负责创建、调度和执行线程任务。这个线程池默认的实现
+    // 是ThreadPerTaskExecutor，这个线程池没有那么多负责功能，即我们常用的核心线程，最大线程，等待队列等。这个线程池的执行方法就是
+    // 调用这个ThreadPerTaskExecutor的executor方法启动一个新线程。是不是这里跟理解的不太一样，不是说一个EventLoop一个线程吗。
+    // 其实是每一个EventLoop在第一次提交任务时，调用这个的executor，启动了一个线程，这个线程会死循环，整个eventLoop生命周期内不结束
+    // 再进一步 真实的EventLoop在启动任务时，还做了两部操作，一个是为了executor时传入EventLoop，另一个是在执行任务前往fastThreadLocal
+    // 里面加入eventLoop finally里面也加入eventLoop
+    // 具体查看 ThreadExecutorMap.apply(executor, this);
+    // 再进一步说明一下，启动eventLoop的线程的不是ThreadPerTaskExecutor，而是一个Executor的匿名内部类对象，里面转调了ThreadPerTaskExecutor实例的
+    // executor，这一步传入了eventLoop对象 ，然后再执行任务的时候，将EventLoop设置到当前线程的fastThreadLocal，执行完后又设置了一次，我感觉这个线程完的时候
+    // 也就是eventLoop对象完结的时候 既然这个finally在销毁时才执行，也就是永远不会执行，除非这个eventLoop结束了
+    // 这里是个通用的方法，开发人员可能会调用apply方法这么执行，因为方法入参需要EventExecutor对象，我们开发人员谁会自己new一个这个对象呢
+    // 什么场景下用呢，DefaultEventExecutorGroup 自定义业务线程池时，执行短任务时会使用，我们自定义的DefaultEventExecutorGroup这个里面
+    // 执行任务时，启动的任务可能不会是死循环的，所以这下应该清楚了
     protected MultithreadEventExecutorGroup(int nThreads, Executor executor, Object... args) {
         this(nThreads, executor, DefaultEventExecutorChooserFactory.INSTANCE, args);
     }

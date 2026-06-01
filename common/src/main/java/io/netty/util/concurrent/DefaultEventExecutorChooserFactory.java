@@ -37,6 +37,9 @@ public final class DefaultEventExecutorChooserFactory implements EventExecutorCh
     }
 
     private static boolean isPowerOfTwo(int val) {
+        // 一个2次幂的数字 的二进制中只有一个1  取负数后，这个1的位置不会变，只是高位全变成1，所以val & -val 会保留这个1，结果就等于val
+        // 一个数的负数 是先取反，再加1 比如
+        // 8的二进制是00001000  取反为11110111  再加1  就是11111000 然后 & 00001000 = 00001000
         return (val & -val) == val;
     }
 

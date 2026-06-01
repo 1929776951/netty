@@ -16,6 +16,7 @@
 package io.netty.channel;
 
 import io.netty.util.concurrent.EventExecutorChooserFactory;
+import io.netty.util.concurrent.RejectedExecutionHandler;
 import io.netty.util.internal.EmptyArrays;
 
 import java.util.ArrayList;
@@ -185,9 +186,18 @@ public class MultiThreadIoEventLoopGroup extends MultithreadEventLoopGroup imple
 
     // The return type should be IoHandleEventLoop but we choose EventLoop to allow us to introduce the IoHandle
     // concept without breaking API.
+    // 这个args从后面的调用可以看出来，有这么几个，按照顺序来的，
+    // args[0]  IoHandlerFactory 如果有的话
+    // args[1]  RejectedExecutionHandler
+    // args[2]  EventLoopTaskQueueFactory(taskQueueFactory)
+    // args[3]  EventLoopTaskQueueFactory tailTaskQueueFactory
+    // 如果你有自定义的需求，你也可以写一个自定义类，继承MultiThreadIoEventLoopGroup，继续从这个可变参数里面取其他对象
+    // 就像NioEventLoopGroup实现一样。自定义了，args里面传什么，怎么解析，你自定义实现的时候决定。
+    // 但这里决定死了，第一个一定是IoHandlerFactory
     @Override
     protected EventLoop newChild(Executor executor, Object... args) throws Exception {
         IoHandlerFactory handlerFactory = (IoHandlerFactory) args[0];
+        // 提取出来第一个参数，然后将剩下的参数继续传入newChild重载方法
         Object[] argsCopy;
         if (args.length > 1) {
             argsCopy = new Object[args.length - 1];
