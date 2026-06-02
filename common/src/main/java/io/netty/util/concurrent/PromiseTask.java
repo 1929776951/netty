@@ -18,6 +18,8 @@ package io.netty.util.concurrent;
 import java.util.concurrent.Callable;
 import java.util.concurrent.RunnableFuture;
 
+// DefaultPromise 纯异步结果容器，只负责存储结果、通知监听器、本身不是可执行任务
+// PromiseTask 继承自DefaultPromise 又实现了RunnableFuture ，它既是一个Promise，又是一个可被线程池执行的任务。
 class PromiseTask<V> extends DefaultPromise<V> implements RunnableFuture<V> {
 
     private static final class RunnableAdapter<T> implements Callable<T> {

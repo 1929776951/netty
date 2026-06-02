@@ -61,6 +61,7 @@ public class DefaultPromise<V> extends AbstractFuture<V> implements Promise<V> {
     private static final StackTraceElement[] CANCELLATION_STACK = CANCELLATION_CAUSE_HOLDER.cause.getStackTrace();
 
     private volatile Object result;
+    // 这个executor是用来执行监听器的。
     private final EventExecutor executor;
 
     /**
