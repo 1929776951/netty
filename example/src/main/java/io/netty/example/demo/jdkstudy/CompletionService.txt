@@ -1,0 +1,76 @@
+1、CompletionService本质是一个"任务提交"+"结果队列"的组合工具
+它有submit方法提交一个runnable或者callable
+submit方法可能会提交很多任务，这些任务的执行结果可以按照完成顺序获取结果，而不是按照提交顺序。对比ExecutorService，
+你需要遍历所有Future，并逐个get()获取结果。
+从里面的take和poll方法可以看到是获取结果的
+take方法获取结果，如果当前没有已完成的任务，会一直等待，直到有任务完成或线程被中断。 一定会返回一个已完成的任务的Future，不会返回null
+，如果等待过程中线程被中断，会抛出InterruptedException
+适用于 你必须等待至少一个任务完成，不关心等待时间，比如主流程依赖任务结果才能继续
+poll方法 非阻塞 立即检查是否有已经完成的任务，不会等待，直接返回结果，有完成的任务 返回对应的Future，无完成任务 返回null。不会抛出InterruptedException
+还有一个带超时时间的poll方法，在超时时间内，有任务完成就返回，没任务完成就返回null，等待期间被中断，会抛出InterruptedException
+
+2、---------------------volatile作用说明start-------------------------------------------------
+    两个核心作用:
+        可见性:一个线程对volatile变量的写操作，会立即刷新到主内存，其他线程读取时必须从主内存重新加载，而不是使用本地缓存。
+        有序性:禁止CPU和编译器对volatile变量的读写操作进行指令重排序，保证代码执行顺序与程序顺序一致。
+    可见性这里就不多说了。
+    这里主要说一下有序性，某些情况下不控制这个有序性会造成什么问题。
+
+    Volatile读操作的屏障策略，是在读之后，连续插入两道屏障
+       a、LoadLoad屏障：禁止"后面的普通读"重排到"当前的volatile读"之前。确保线程必须先完成volatile变量的最新值读取，才能读取后续的普通变量
+       b、LoadStore屏障: 禁止"后面的普通写"重排到"当前的volatile读"之前。确保线程必须先完成volatile变量的最新值读取，才能执行后续的普通变量写入操作
+    总结: volatile读之后的所有普通读写操作，绝对不能重排序都volatile读之前。
+
+    普通读写指令---> volatile读--->LoadLoad屏障--->LoadStore屏障--->普通写--->普通读
+
+
+    Volatile写操作的屏障策略，是在写前面和后面各插一道屏障
+       a、StoreStore屏障: 禁止"前面的普通写"重排序到当前volatile写之后，确保在volatile变量被修改并刷新到主内存之前，它之前的所有普通变量
+   修改操作都已经执行完毕并刷新到了主内存。
+       b、StoreLoad屏障:禁止"前面的volatile写"与后面的volatile读或写发生重排序。
+
+      普通读写指令---> StoreStore屏障--->volatile写--->StoreLoad屏障--->普通读写指令
+
+   ---------------------volatile作用说明end-------------------------------------------------
+
+   UNSAFE.putOrderedInt(...) 这个方法 会在这个方法之前增加一个StoreStore屏障， 语义是在这个写操作之前的所有普通写操作(这里是写入outcome)
+   必须全部刷新到主内存，才能执行当前的这个写操作。  这里使用这个SS屏障，保证了状态变为NORMAL的时候，outcome一定有值了。防止当另一个线程调用get()
+   方法时，它读取到state == NORMAL 时，读取outcome时一定有值，如果不用这个，CPU对改状态和outcome重排序的话，可能刚设置为NORMAL，另一个线程
+   调用get方法，其中判断 state == NORMAL ,读取outcome时可能读取到null或者旧值，产生严重bug
+    protected void set(V v) {
+        if (UNSAFE.compareAndSwapInt(this, stateOffset, NEW, COMPLETING)) {
+            outcome = v;
+            UNSAFE.putOrderedInt(this, stateOffset, NORMAL); // final state
+            finishCompletion();
+        }
+    }
+    UNSAFE.putOrderedInt 这个方法强制保证了，outcome=v这一步必须在UNSAFE.putOrderedInt(this, stateOffset, NORMAL)这一步之前完成
+
+
+    那这里为什么不使用 putIntVolatile方法呢，因为这个方法还会在其后插入StoreLoad屏障，就类似上面
+        普通读写指令---> StoreStore屏障--->volatile写--->StoreLoad屏障--->普通读写指令
+     这样，前后都会插入屏障。这样开销更大，性能更差，我们这里的实际需求是,我们并不关系finishCompletion();的操作是否会重排到UNSAFE.putOrderedInt(this, stateOffset, NORMAL);
+     这个操作之前，我们只关系"结果"必须在"状态"之前准备好。
+
+public ExecutorCompletionService(Executor executor) {
+        if (executor == null)
+            throw new NullPointerException();
+        this.executor = executor;
+        this.aes = (executor instanceof AbstractExecutorService) ?
+            (AbstractExecutorService) executor : null;
+        this.completionQueue = new LinkedBlockingQueue<Future<V>>();
+    }
+
+为什么创建ExecutorCompletionService时，要传入一个Executor，传统的Executor没有 "谁先做完我就先拿谁的结果"这种功能，这个ExecutorCompletionService
+相当于一个包装类，装饰类。
+ 那成员变量中既然有了executor，为什么还需要一个aes
+ 主要是出于职责分离
+ executor是接口，只有execute方法，也就是用于提交任务并执行。
+ aes 是具体实现，它有创建FutureTask的功能。负责将callable和runnable封装成可被线程池执行的FutureTask功能。
+
+
+
+
+
+
+

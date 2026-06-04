@@ -1,0 +1,77 @@
+将线程池状态和工作线程数量打包进一个int变量中
+这种设计被称为 "位运算压缩(Bit Packing)" 这样做的好处是只需要一次性原子操作就能同时更新状态和计数，保证了并发安全且效率极高
+
+
+private static final int COUNT_BITS = Integer.SIZE - 3;
+ java的int是32位的，用高三位存储状态，剩下的29位留给线程计数。
+ private static final int CAPACITY   = (1 << COUNT_BITS) - 1; 容量掩码
+ 1左移29位，那么就是 00100000 00000000 00000000 00000000 这个值是2^29
+ 减去1的话就变成了   00011111 11111 111 11111111 11111111  如果你想从某个数中比如这里从ctl中计算有多少线程时，只需要用
+ CAPACITY & ctl  因为CAPACITY的高三位时0，和任何数按位与还是000，剩下的29位都是1，与任何数按位与都是任何数，相当于就求出了ctl中的低29位中代表的数字
+ 即线程数了
+ =====================原码、反码、补码======================
+ 正数的 三码一样
+ 负数在计算机中是用补码存储的
+   负数的补码计算方法 比如-10    最高位1
+  原码     10000000 00000000 00000000 00001010
+  反码     11111111 11111111 11111111 11110101  符号位不变，其他取反
+  反码加一  11111111 11111111 11111111 11110110
+ =====================原码、反码、补码======================
+
+
+  private static final int RUNNING    = -1 << COUNT_BITS;  RUNNING状态的掩码
+  11100000 00000000 00000000 00000000 高三位是1
+  private static final int SHUTDOWN   =  0 << COUNT_BITS;  SHUTDOWN状态的掩码
+  00000000 00000000 00000000 00000000  高三位是0
+
+    private static final int STOP       =  1 << COUNT_BITS; STOP状态的掩码
+    00100000 00000000 00000000 00000000
+    private static final int TIDYING    =  2 << COUNT_BITS;
+    01000000 00000000 00000000 00000000
+    private static final int TERMINATED =  3 << COUNT_BITS;
+    11000000 00000000 00000000 00000000
+
+   private static int ctlOf(int rs, int wc) { return rs | wc; }
+   // 将状态和数量打包进一个int   rs 只有高三位有值  wc 低29位有值  按位与会将高三位和低29都保留下来到一个int值中
+
+   private static int runStateOf(int c)     { return c & ~CAPACITY; }
+   private static int workerCountOf(int c)  { return c & CAPACITY; }
+   // 这两个是解包方法  runStateOf 解出来 状态值  workerCountOf 解出来线程数量值
+
+  如果不用ctl，则需要使用一个state和一个count 每次修改都要处理复杂的竟态条件 ctl只需要一次cas 就能原子性的更新状态和线程数。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

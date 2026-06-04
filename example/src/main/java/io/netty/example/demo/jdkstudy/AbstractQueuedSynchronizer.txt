@@ -1,0 +1,136 @@
+父类的
+private transient Thread exclusiveOwnerThread;
+ 当一个线程成功获取了由AQS实现的锁，AQS会将当前线程设置到这个属性
+
+static final Node SHARED = new Node();
+ static final Node EXCLUSIVE = null;
+ 这两个是用来区分当前节点是在"排队等独占锁"还是在"排队等共享锁" 属于模式标记
+
+         static final int CANCELLED =  1; // 表示该节点因为超时或被中断而取消了等待
+         static final int SIGNAL    = -1;
+         // 当当前节点释放锁或取消时，它必须检查这个标志。如果时SIGNAL，它就有责任取唤醒它的后继几点。简单说就是"我后面有人排队睡着了，我走的时候得叫醒他"
+         static final int CONDITION = -2;
+         // 表示该节点当前不在同步队列中，而是在条件队列中等待。这种节点不会参与同步队列的竞争。只有当其他线程调用了signal方法，它才会从条件队列
+         转移到同步队列。
+         static final int PROPAGATE = -3;
+         // 这些是等待状态 描述当前节点的生存状态
+
+
+         Node nextWaiter;  在同步队列中 不指向下一个节点，而是作为一个标志位 如果nextWaiter==Node.EXCLUSIVE 表示该节点时独占模式
+         如果nextWaiter==SHARED 表示该节点时共享模式
+         在条件队列中，nextWaiter才真正作为指针，指向下一个正在等待条件的节点。
+         这个nextWaiter时没有volatile修饰的，因为条件队列的操作(await/signal)必须在持有独占锁的情况下进行，因此不需要额外的volatile语义来保证并发安全
+
+
+static final long spinForTimeoutThreshold = 1000L;
+当线程等待锁的剩余时间小于或等于这个阈值时，不进行挂起，而是选择快速自旋等待。
+因为挂起LockSupport.parkNanos挂起线程是一个相对“重”的操作，涉及操作系统调度，上下文切换等。如果等待时间极端，比如几百纳秒，挂起再唤醒的开销可能比直接
+空转(自旋)还要大。
+ 牺牲了极短时间内的CPU资源，换取了更高的响应速度和更低的系统开销。这个值1000L是经过大量测试和经验得出的"经验值"，在绝大多数场景下都能取得较好的性能平衡。
+
+ predecessor 前任 前辈 前身 原先事物
+ public final boolean hasQueuedPredecessors() {
+         // The correctness of this depends on head being initialized
+         // before tail and on head.next being accurate if the current
+         // thread is first in queue.
+         Node t = tail; // Read fields in reverse initialization order
+         Node h = head;
+         Node s;
+         return h != t &&
+             ((s = h.next) == null || s.thread != Thread.currentThread());
+     }
+
+上面的方法 是否拥有前一个队列元素。换言之：当前线程用不用排队。返回false 不用排队，返回true，需要排队
+
+上面方法中 先读取tail节点给到局部变量t  再读取head节点给到局部变量h 为什么要先读取tail 再读取head 其实是主要防止后面的h.next报空指针，原因是什么呢？
+ 队列初始化的时候 会执行enq方法里面的一段代码，具体如下
+    private Node enq(final Node node) {
+            for (;;) {
+                Node t = tail;                          --------------1
+                if (t == null) { // Must initialize     --------------2
+                    if (compareAndSetHead(new Node()))  --------------3
+                        tail = head;                    --------------4
+                } else {
+                    node.prev = t;
+                    if (compareAndSetTail(t, node)) {
+                        t.next = node;
+                        return t;
+                    }
+                }
+            }
+        }
+    初始化队列有上面四句代码，着四句代码不是原子的，可能执行任何一行代码后，cpu让出执行权。我们分场景分析一下
+
+     上卖弄初始化代码是先给head赋值，然后再给tail赋值，那么就知道
+        a、如果tail为null，那么head 可能是null 也可能不是null
+        b、如果tail不为null，那么head一定不为null
+     在hasQueuedPredecessors方法中，如果我们是按照先将head的值赋值给h，再执行tail的值赋值给t的话 可能存在
+        a、执行Node h = head 时，同步队列已经初始化完成，也就是上面4行代码都执行完成了，那么此时h和tail都不为null
+        b、执行Node h = head 时，上面第三步还未执行，那么此时h就赋值为null了，第三步为执行那么第四步肯定还未执行(volatile屏障机制，不会重排序) 此时h 和 t都是null
+        c、执行Node h = head 时 未执行到第三步，那么此时h赋值就是null了，在执行Node t = tail时，上面执行了第四步，那么此时h为null tail 不为null  这种
+        情况是有问题的，因为h==null tail!=null h!=t,那么s = h.next时就会报空指针了
+        d、执行Node h = head 时 已经执行了第三步，h不为null，然后等到执行Node t = tail时，上面第四步还未执行，此时h!=null tail==null 不会出空指针
+     所以先读取head 赋值给h  再读取tail赋值给t 会有c这种情况有问题，所以不能先读取head 再读取tail
+
+     那我们看下先读取tail再读取head
+
+        a 执行Node t = tail 时，上面第三步还未执行 那么t为null 执行Node h = head 时上面第三步还未执行，h也为null
+        b 执行Node t = tail 时，上面第三步执行 但是还未执行第四步，执行Node h = head 那么此时t为null h不为null
+        c 执行Node t = tail 时，上面第三步执行，第四步也执行完成 执行Node h = head，那么此时h和tail都不为null
+     所以先执行Node t = tail 再执行 node h = head 不会产生h为null  t不为null的情况。
+
+
+    继续分析后面的  ((s = h.next) == null || s.thread != Thread.currentThread());
+    要走到上面代码 一定是h!=t
+     符合这种情况的：
+      a、 h!=t 有两种情况 一种是还未初始化完成h 不为null  t为null 一种是已经有入队的node了
+          如果(s = h.next) == null  成立 说明 上面第三步已经完成，但是还没有执行tail=head 也就是第四步还未执行，导致h!=t成立，此时
+      h.next == null 也就是(s = h.next) == null成立，这个时候表明已经有线程在执行入队操作了，只是还没有入队完成，那么当前线程需要排队
+      就是返回true
+      b、同步队列已经完成了初始化，但是由于释放锁等操作，导致此时同步队列中只有一个头节点，head和tail都指向这个头节点，此时有一个线程执行入队操作
+      ，刚执行完compareAndSetTail(pred,node)，把tail指针指向自己新建的节点，导致h !=t成立，但是还没有执行pred.next = node; 所以此时
+      (s = h.next) == null也成立，说明此时也有线程再入队，但是还没入队完成，那么当前线程也是需要排队。
+
+     还有一种场景h!=t成立，(s = h.next) == null  不成立，就需要s.thread != Thread.currentThread()这个判断 ，说明当前同步队列至少
+     有两个节点并且头节点的后继节点不为null，并且说明这个后继节点锁代表的线程跟当前线程不是同一个线程，这个就是最标准的情况了，同步队列中已经有线程
+     在等着获取锁了，那么当前的线程就只能取排队了。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
