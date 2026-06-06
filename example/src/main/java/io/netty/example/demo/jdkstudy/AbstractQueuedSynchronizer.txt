@@ -96,10 +96,108 @@ static final long spinForTimeoutThreshold = 1000L;
      在等着获取锁了，那么当前的线程就只能取排队了。
 
 
+    public final void acquire(int arg) {
+        if (!tryAcquire(arg) &&
+            acquireQueued(addWaiter(Node.EXCLUSIVE), arg))
+            selfInterrupt();
+    }
+    上面的acquire(获得)的方法主要有三个逻辑
+        a、尝试获取，主要就是判断state状态
+        b、addWaiter 主要就是入队，分为两种情况:未初始化  已初始化
+        c、acquireQueued 入队的Node(线程)是否要在尝试获取一次锁，如果是第一个等待的就再尝试一次，剩下的就要挂起，不能一直死循环获取
+    因为我们的方法就是获取锁，所以我们的这些代码逻辑中，不是原子操作的，就都会有并发情况。
+    获取的锁的本质是什么呢，就是当前线程调用acquire方法后，是否会进入阻塞，拿到锁就不阻塞，拿不到就阻塞。
 
 
+    final boolean acquireQueued(final Node node, int arg) {
+            boolean failed = true;
+            try {
+                boolean interrupted = false;
+                for (;;) {
+                    final Node p = node.predecessor(); ------------------------1
+                    if (p == head && tryAcquire(arg)) {  ------------------------2
+                        setHead(node);       ------------------------3
+                        p.next = null; // help GC    ------------------------4
+                        failed = false;      ------------------------5
+                        return interrupted;    ------------------------6
+                    }
+                    if (shouldParkAfterFailedAcquire(p, node) &&
+                        parkAndCheckInterrupt())   ------------------------7
+                        interrupted = true;
+                }
+            } finally {
+                if (failed)                            ---------------------- 8
+                    cancelAcquire(node);              ---------------------- 9
+            }
+        }
+
+----------------------进入到上面的acquireQueued方法后，会不会有并发情况呢 我们一句一句分析
+ 1代码  因为node是当前线程刚入队的节点，它的前驱节点p在入队完成后是固定的， 同步队列中节点的prev指针在入队时就已经确定，且不会被其他线程修改 所以这一句不存在并发问题
+ 拿到的p一定是当前节点的真实前驱。
+
+ 2代码 因为node刚入队，
+      公平锁时，我们先判断p == head 为true，还未执行 tryAcquire(arg) 时 因为时公平锁，我们是队列中第一个等待的，如果此时有一个线程拿到锁，未释放，
+      执行tryAcquire时会失败，然后就会走到7代码，判断释放挂起
+      如果此时没有线程拿到锁，那么这里的tryAcquire(arg) 会成功，那就成功返回了
+      如果此时没有线程拿到锁 还有一种特殊情况，在调用tryAcquire(arg)时成功了，但是在成功之前当前线程被打断了，仍然会拿到锁，但是会返回false，
+      外层的if (!tryAcquire(arg) &&
+                     acquireQueued(addWaiter(Node.EXCLUSIVE), arg))
+                     selfInterrupt();
+       if判断是false，不会selfInterrupt 不会走，没有本次这次打断就没有被消费，无需这里的selfInterrupt，所以在当前线程中，还是可以用isInterrupted获取中断标记的。
+     如果tryAcquire(arg)没有成功，会走到7代码，调用shouldParkAfterFailedAcquire(p, node) 判断是否应该被挂起
+        公平锁中第一个等待节点且tryAcquire(arg)如果没有成功 ，那么就是有不在队列中的一个线程还未释放锁，这边shouldParkAfterFailedAcquire(p, node)中判断p不是signal
+        ，然后将p设置为signal，等到持有锁的线程释放锁的，时候，会看到head是signal，然后就会唤醒下一个节点，但是这里，如果在释放锁的时候，head还未被设置为signal，那还有办法
+        唤醒吗，这里如果还未设置为signal，说明还未阻塞，这个线程还继续执行，设置为signal，然后返回false，那么 acquireQueued方法的死循环会再次调用，判断2行的代码p==head
+        且这次已经释放锁了，能拿到锁了，就不会阻塞了。
 
 
+      线程的Thread.interrupted() 获取中断标记 + 清除中断位(用完变为false)
+           实例.interrupt() 发中断请求，设置线程中断标记为true，不会立刻停止线程
+            Thread.isInterrupted()获取当前中断标记，不清除标志
+
+  为什么上面failed是true的时候才调用cancelAcquire?
+  只有成功拿到锁 才会把failed设为false，并直接退出循环。
+
+  只有线程在获取锁的过程中被异常终止，且没有成功拿到锁，才会走到finally filed=true  此时 线程已经不可能再继续自旋枪锁了，但它还在AQS队列里，
+  如果不清理，会变成僵尸节点，阻塞后面线程的唤醒。
+   当成功拿到锁，就不需要cancelAcquire，线程已经成功获取到锁，setHead(node)已经把当前节点变成新的哨兵节点，脱离了等待队列。
+
+   failed = true  线程永远拿不到锁了，要从队列中清理
+   failed = false 线程已经拿到锁了，节点已经变成新的哨兵，无需取消，继续参与锁的流程。
+
+-------------------------------------------------------------------------------------
+private void cancelAcquire(Node node) {
+        if (node == null)                  ---------------------------------1
+            return;
+        node.thread = null;                ---------------------------------2
+        Node pred = node.prev;             ---------------------------------3
+        while (pred.waitStatus > 0)        ---------------------------------4
+            node.prev = pred = pred.prev;   ---------------------------------5
+        Node predNext = pred.next;         ---------------------------------6
+        node.waitStatus = Node.CANCELLED;   ---------------------------------7
+        if (node == tail && compareAndSetTail(node, pred)) {  ---------------------------------8
+            compareAndSetNext(pred, predNext, null);      ---------------------------------9
+        } else {
+            int ws;
+            if (pred != head &&
+                ((ws = pred.waitStatus) == Node.SIGNAL ||
+                 (ws <= 0 && compareAndSetWaitStatus(pred, ws, Node.SIGNAL))) &&
+                pred.thread != null) {              ---------------------------------10
+                Node next = node.next;
+                if (next != null && next.waitStatus <= 0)   ---------------------------------11
+                    compareAndSetNext(pred, predNext, next);  ---------------------------------12
+            } else {
+                unparkSuccessor(node);   ---------------------------------13
+            }
+            node.next = node; // help GC
+        }
+    }
+
+
+1和2 是安全校验，如果为空，什么都不做
+3，4，5 是从当前节点开始 判断前一个节点的状态是否为cancel状态，是的话就将当前节点的前一个节点设置为前一个节点的前一个节点。 最终，pred指向
+最靠近当前节点的，未被取消的前驱节点。 能保证后续操作基于有效前驱，避免队列中堆积无效取消节点
+7 原子性赋值，java的变量赋值是原子操作，将当前节点标记为取消，后续线程会自动跳过它
 
 
 
