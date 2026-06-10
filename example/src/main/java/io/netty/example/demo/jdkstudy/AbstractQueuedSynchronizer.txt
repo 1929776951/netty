@@ -207,6 +207,37 @@ private void cancelAcquire(Node node) {
 
 
 
+    private void unparkSuccessor(Node node) {
+        int ws = node.waitStatus;
+        if (ws < 0)
+            compareAndSetWaitStatus(node, ws, 0);
+        Node s = node.next;
+        if (s == null || s.waitStatus > 0) {
+            s = null;
+            for (Node t = tail; t != null && t != node; t = t.prev)
+                if (t.waitStatus <= 0)
+                    s = t;
+        }
+        if (s != null)
+            LockSupport.unpark(s.thread);
+    }
+
+第一步将传入的node的状态设置为0，是因为判断了ws<0，小于0的状态有SIGNAL CONDITION PROPAGATE ,SIGNAL PROPAGATE 这两个状态的触发场景不同，
+但SIGNAL 用于独占锁的串行唤醒，后者用于共享锁的批量传播唤醒。但他们在unparkSuccessor方法中处理的逻辑是完全一致的。CONDITION状态不会在同步队列
+存在。
+    compareAndSetWaitStatus(node, ws, 0);这一行的作用是将状态设置为0，使用CAS是为了确保只有当前线程成功将状态从负数改为0，其他线程即使
+也尝试修改也会失败，从而避免了多个线程同时唤醒同一个后继节点的问题。
+    这里compareAndSetWaitStatus(node, ws, 0) 这一步如果失败 为啥不使用重试(自旋)?这里设置失败意味着其他线程正在并发修改这个节点的状态。能修改
+当前节点状态的线程，只有它的后继节点。说明此时后继节点正在执行shouldParkAfterFailedAcquire，并且已经成功把状态改回了-1.
+
+       这里为什么要从尾节点开始向前遍历呢
+        入队的时候是先设置前驱指针，再设置后继指针，这两步不是原子的，如果从后往前找，因为入队时是先设置prev指针的，所以只要节点进入了队列，它的prev指针
+        一定是有效的，通过tail一路沿着prev往回找，一i的那个能找到那个刚刚入队，但next还没有来得及被赋值的节点。 确保能找到那些"正在排队但还没完全排好"的节点
+
+        为什么状态是小于等于0，而不是只找-1的， 新入队的节点默认状态是0，如果只找-1，会漏掉那些刚进来还没来得及把自己改成-1的线程。
+       一直覆盖s的值，是为了找到离head最近的那个有效节点。
+
+
 
 
 

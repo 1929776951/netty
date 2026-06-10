@@ -42,6 +42,265 @@ private static final int COUNT_BITS = Integer.SIZE - 3;
 
 
 
+public void execute(Runnable command) {
+        if (command == null)
+            throw new NullPointerException();
+       // 获取当前线程池的控制状态(这里面包含运行状态和线程数)
+        int c = ctl.get();
+        // 如果当前工作线程数小于核心线程数，则尝试添加一个核心线程来执行任务，注意这里是尝试，可能添加不成功，如果添加成功就返回
+        // 如果尝试添加失败，可能是线程池的状态发生变化或者线程数量发生变化 则就重新获取下运行状态和线程数量
+        if (workerCountOf(c) < corePoolSize) {
+            if (addWorker(command, true))
+                return;
+                // 上面addWorker失败，说明世界变了，目前的情况变了，重新获取线程池的运行状态和线程数量
+            c = ctl.get();
+        }
+        // 如果判断线程池运行状态是运行中，这里为什么要入队，因为线程池的状态是动态变化的
+        // addWorker失败的原因有如下三个 1、线程池的状态是大于shutdown  2、线程池状态是shutdown firstTask == null 队列不是空  这三个同时不满足时
+        // 3 线程数量大于CAPACITY 或者大于核心线程数。
+        // 所以这里先判断是不是running状态，排除1和2的情况，如果是 说明是线程数量达到最大或者达到核心线程数。 所以只能判断是否能入队了
+        // 这里有两种情况，因为都是有并发情况的，所以这里的两个判断都可能失败。
+        // A 、isRunning(c) 失败  也就是说线程池当前不是运行状态，线程池的运行状态如果已经不是running状态了，不能再被启动或者恢复运行
+        // 所以这里第一步判断如果是false，进入到下面的else if 再次入队 基本肯定是失败的，就直接会进入reject(command)，任务拒绝
+        // B、isRunning(c) 成功，尝试入队 这里入队分为两种 成功和失败
+            入队成功 这里又做了二次检查，再次获取线程池的运行状态和线程数量，因为可能在workQueue.offer(command)的时候，线程池正好被关闭了
+                    再次检查，如果不是运行状态，移除任务(从队列移除任务，里面的tryTerminate的调用需要进一步分析为什么需要)，然后拒绝任务
+                    如果进入else if (workerCountOf(recheck) == 0)  为什么要判断线程数量是否为0，能走到这里，并且这个线程数量是0的概率其实很小
+                    ，因为上面因为线程数量达到核心线程数，addWorker才失败，才走到这里，在这极短的时间内，线程数刚好变成0的概率是极小的，但是概率不为0，就
+                    说明可能发生，这里就要考虑，必须有一个兜底  这里举几个可能发生的列子 （1） 异常引发的"雪崩效应" 如果此时系统遇到了外部依赖故障，(比如数据库连接池耗尽，网络超时)导致当前正在执行任务
+                    的多个核心线程同时抛出未捕获异常，在execute()提交任务瞬间，这些线程可能刚好处于崩溃退出的边缘。(2)动态调整参数，在洪峰期间，运维或者监控意外触发了动态缩容，调用setCorePoolSize(0)，并
+                    配合了allowCoreThreadTimeOut(true)，线程池可能会瞬间开始回收核心线程。addWorker(null,false)表示创建的是非核心线程(或者普通线程)，不需要给这个线程
+                    分配具体的"firstTask"，主要目的是从队列里捞取任务处理。 这里其实对于每个线程没有标记说我是核心线程或者非核心线程，只是告诉addWorker，应该用哪个数值作为天花板(上限)
+            入队失败，workQueue.offer(command)是非阻塞的方法，如果队列满了，它会立即返回false，能走到else if (!addWorker(command, false)) 这个最后的else if ，说明
+            核心线程满了(否则第一步就创建核心线程了)，队列也满了(offer失败了) 既然队列满了，说明当前的并发压力很大，现有的核心线程处理不过来了。这时候线程池的标准应对策略
+            就是:扩容，创建非核心线程(救急线程)来帮忙干活。这最后一个else if里面的addWorker(command,false) 第二个参数是false。
+            第一次尝试创建核心线程，第二次尝试创建非核心线程。
+            从这里也可以看出来，线程池的任务丢进去，如果核心线程数不满，则直接创建线程，并执行这个丢进去的任务，如果核心线程数满了，那就往队列里面丢任务
+            ，如果队列也满了，那最后才创建非核心线程。这时如果非核心线程也创建不了，那就拒绝任务。
+
+
+        if (isRunning(c) && workQueue.offer(command)) {
+            int recheck = ctl.get();
+            if (! isRunning(recheck) && remove(command))
+                reject(command);
+            else if (workerCountOf(recheck) == 0)
+                addWorker(null, false);
+        }
+        else if (!addWorker(command, false))
+            reject(command);
+    }
+----------------------------------------------------------
+
+
+ private void addWorkerFailed(Worker w) {
+        final ReentrantLock mainLock = this.mainLock;
+        mainLock.lock();
+        try {
+            if (w != null)
+                workers.remove(w);
+            decrementWorkerCount();
+            tryTerminate();
+        } finally {
+            mainLock.unlock();
+        }
+    }
+
+这里加锁，是为了保证workers的移除操作和减线程数量的原子性，防止状态不一致。
+
+addWorkerFailed 是针对某一个worker 添加失败的执行，那里面为什么要调用tryTerminate();取检查整个线程池的状态呢
+这里就是在ThreadPoolExecutor的设计中，没有上帝视角的"监控线程"专门做这个事情，所有的状态变更都是事件驱动的，人人有责的。
+   只有"离开者"最清楚家里还剩几个人。当一个worker退出时，它是一个个确切知道"此时此刻我即将减少一个劳动力的线程"。如果它不检查，难道要等下一个任务
+   提交时才检查吗？那如果此时没有新任务提交，线程池岂不是永远处于"假死"状态。退出动作本身就是触发检查的最佳时机。
+   让每个退出的线程都去喊一声"我要走了，看看能不能关门"，是保证实时性最稳妥的办法。
+
+    final void tryTerminate() {
+        for (;;) {
+            int c = ctl.get();
+            if (isRunning(c) ||
+                runStateAtLeast(c, TIDYING) ||
+                (runStateOf(c) == SHUTDOWN && ! workQueue.isEmpty()))
+                return;
+            if (workerCountOf(c) != 0) { // Eligible to terminate
+                interruptIdleWorkers(ONLY_ONE);
+                return;
+            }
+
+            // 下面的cas操作还需要获取锁，是因为如果代码走到这里，说明workerCountOf(c) == 0了，但是如果不加锁，可能在下麦呢cas执行的极端时间内
+            // 或者在它获取锁排队的瞬间，可能发生以下情况:新任务提交 另一个线程调用了executor()，创建了 一个新的worker，还有可能是worker退出。
+            // 如果此时还是将状态改为tidying，那就出问题了，线程池明明还有活着的线程，这里却要终止线程池。
+            // 加锁的作用，mainLock是线程池的全局锁，execute()添加新worker时，必须获取mainLock  worker退出减少计数时，也必须获取mainLock
+            // 因此获取mainLock就是为了阻塞住所有可能改变workerCount的操作。
+            final ReentrantLock mainLock = this.mainLock;
+            mainLock.lock();
+            try {
+                // 为什么外层需要死循环?
+                if (ctl.compareAndSet(c, ctlOf(TIDYING, 0))) {
+                    try {
+                        terminated();
+                    } finally {
+                        ctl.set(ctlOf(TERMINATED, 0));
+                        termination.signalAll();
+                    }
+                    return;
+                }
+            } finally {
+                mainLock.unlock();
+            }
+            // else retry on failed CAS
+        }
+    }
+
+--------------------------------------------------------------------------------------
+
+private Runnable getTask() {
+        // 上一次从队列取任务是否超时了，初始为false
+        boolean timedOut = false;
+
+        for (;;) {
+            int c = ctl.get();
+            int rs = runStateOf(c);
+
+            // 这个if判断可以翻译为:
+            // 如果当前线程池状态为STOP或者TIDYING或者TERMINATE或者工作队列为空 中的任何一种。
+            // 如果满足就返回null，目前线程结束生命周期。
+            if (rs >= SHUTDOWN && (rs >= STOP || workQueue.isEmpty())) {
+                decrementWorkerCount();
+                return null;
+            }
+
+            int wc = workerCountOf(c);
+            // allowCoreThreadTimeOut  默认值false，核心线程即使处于空闲状态，也会一直存活，不会被回收，保证线程池能快速处理任务
+            // 设置为true，核心线程会和非核心线程一样，在空闲超过keepAliveTime时间后被销毁回收，此时线程池的最小线程数可以降至0
+            // Are workers subject to culling?
+            // 这两个满足其一，就代表下面使用poll(keepAliveTime) 而不是take()死等获取任务
+            // timed还用来表示 线程是否需要超时回收，allowCoreThreadTimeOut为true时，不用考虑当前线程数是否超过核心线程数还是最大线程数，只要超时就需要回收
+            // 另一种情况也需要超时回收，allowCoreThreadTimeOut为false时，当前线程数大于核心线程数，就要超时回收。
+            boolean timed = allowCoreThreadTimeOut || wc > corePoolSize;
+
+            // allowCoreThreadTimeOut默认为false
+            // wc大于最大线程数 或者 当前是允许超时回收且当前线程已经超时(timedOut代表上一次获取任务在keepAliveTime时间没有获取到)
+            // 在满足上面一句话的条件的基础上，还要满足 当前线程数大于1  或者还要满足当前队列时空。
+            // wc >1 表示，即使只剩最后一个线程时，即使满足回收条件，也必须保留。
+            // 或者满足回收条件，此时队列中没有任何任务要处理时才允许回收，
+            // 那么线程池的线程数量可能为0吗？ 可能为0
+            allowCoreThreadTimeOut 为false时
+            // 1、当前线程数大于最大线程数 且 当前线程数 > 1        要回收
+            // 2、当前线程数大于最大线程数 且 任务队列为空          要回收
+            // 3、当前线程数超过核心线程数 且 上一次获取任务超时 且 当前线程数 > 1  要回收
+            // 4、当前线程数超过核心线程数 且 上一次获取任务超时 且 任务队列为空     要回收
+            //allowCoreThreadTimeOut 为true时
+            // 1、当前线程数大于最大线程数 且 当前线程数 > 1  要回收
+            // 2、当前线程数大于最大线程数 且 任务队列为空     要回收
+            // 3、上一次获取任务超时 且 当前线程数 > 1 要回收
+            // 4、上一次获取任务超时 且当前任务队列为空  要回收
+            if ((wc > maximumPoolSize || (timed && timedOut))
+                && (wc > 1 || workQueue.isEmpty())) {
+                // 如果能减少数量成功，cas操作，也就是从上面获取到c开始到这里，还能cas成功，代表这中间没有其他改变线程数量的操作。
+                // cas成功，那么当前线程返回null，当前线程就会结束
+                // 如果不成功，继续循环，重新判断。既然档次循环判断需要回收当前线程，但是没有回收成功，就continue，重新判断一次看是否还需要回收
+
+                if (compareAndDecrementWorkerCount(c))
+                    return null;
+                continue;
+            }
+            // 本次循环如果没有达到回收线程的条件，当前线程就取从队列中获取任务
+            // 这里获取任务，是否死等还是超时就不等，要通过上面的boolean timed = allowCoreThreadTimeOut || wc > corePoolSize;判断
+            // 1 allowCoreThreadTimeOut为true时，就超时获取，如果allowCoreThreadTimeOut为false，但是大于核心线程数了，也超时获取了，
+            // 那么当前线程就要判断是否满足回收，可能当前线程回收了，数据就小于核心线程数了，其他线程就留下了。
+            // 是否是核心线程没有标记  只是某次判断时超过核心线程数量了，当前线程就可以任务时非核心线程，满足回收就可以回收了。
+            try {
+                Runnable r = timed ?
+                    workQueue.poll(keepAliveTime, TimeUnit.NANOSECONDS) :
+                    workQueue.take();
+                if (r != null)
+                    return r;
+                timedOut = true;
+            } catch (InterruptedException retry) {
+                timedOut = false;
+            }
+        }
+    }
+-------------------------------------------------------------------------------------
+
+final void runWorker(Worker w) {
+        Thread wt = Thread.currentThread();
+        Runnable task = w.firstTask;
+        w.firstTask = null;
+        // 这里的unlock()并不是为了释放一把"正在使用的锁"，而是为了把状态从"禁止中断"切换到"允许中断"
+        // 这里的unlock，实际上发生的时state从-1变成了0的过程
+        // 当外部调用shutdownNow()或interruptIdleWorkers()时，底层会调用判断getState()>=0的逻辑
+        // 初始化的时候这个状态时-1，是不满足这个状态的，是没办法打断的，调用了unlock方法后，state=0，满足这个状态，外部调用
+        // shutdownNow时，就能中断这个线程，这里的state不是线程状态，是worker的状态，走到这里的时候，线程肯定已经是start的状态了。
+        // 额外的问题 线程在调用start方法之前就调用interrupt方法会发生什么。仍然会设置中断标志位，线程未启动，没什么影响，启动后，标志为仍有效。
+        // 如果线程的run方法中有类似sleep、wait join 那么在这些方法内部会检测到中断标志位，立即抛出InterruptedException，并自动清除中断标志位。
+        w.unlock(); // allow interrupts
+        boolean completedAbruptly = true;
+        try {
+            while (task != null || (task = getTask()) != null) {
+                // 这里的lock 是为了将worker的状态标记为"忙碌/执行中"，从而屏蔽外部的中断信息
+                // 保护正在运行的任务不被误杀
+                // 如果外部线程调用了shutdownNow(强制关闭)，线程池会遍历所有worker并调用interruptIfStarted()，
+                // 如果不加锁  shutdownNow发现worker的状态是0，就会直接中断线程。这回导致正在运行的run被强行打断，可能引发数据不一致
+                //或者资源未释放的问题
+                // 这里的lock的本质是给当前正在执行的任务穿上一层"防弹衣"，告诉外部:"我正在干活，别打扰我"。
+                w.lock();
+
+                if ((runStateAtLeast(ctl.get(), STOP) ||
+                     (Thread.interrupted() &&
+                      runStateAtLeast(ctl.get(), STOP))) &&
+                    !wt.isInterrupted())
+                    wt.interrupt();
+                try {
+                    beforeExecute(wt, task);
+                    Throwable thrown = null;
+                    try {
+                        task.run();
+                    } catch (RuntimeException x) {
+                        thrown = x; throw x;
+                    } catch (Error x) {
+                        thrown = x; throw x;
+                    } catch (Throwable x) {
+                        thrown = x; throw new Error(x);
+                    } finally {
+                        afterExecute(task, thrown);
+                    }
+                } finally {
+                    task = null;
+                    w.completedTasks++;
+                    w.unlock();
+                }
+            }
+            completedAbruptly = false;
+        } finally {
+            processWorkerExit(w, completedAbruptly);
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
