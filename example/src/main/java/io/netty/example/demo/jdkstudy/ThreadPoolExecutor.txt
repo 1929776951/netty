@@ -234,6 +234,7 @@ final void runWorker(Worker w) {
         // 额外的问题 线程在调用start方法之前就调用interrupt方法会发生什么。仍然会设置中断标志位，线程未启动，没什么影响，启动后，标志为仍有效。
         // 如果线程的run方法中有类似sleep、wait join 那么在这些方法内部会检测到中断标志位，立即抛出InterruptedException，并自动清除中断标志位。
         w.unlock(); // allow interrupts
+        // 记录当前工作线程是否"异常退出"，从而决定后续是否需要"补偿性"地减少工作线程计数。
         boolean completedAbruptly = true;
         try {
             while (task != null || (task = getTask()) != null) {
@@ -244,13 +245,25 @@ final void runWorker(Worker w) {
                 //或者资源未释放的问题
                 // 这里的lock的本质是给当前正在执行的任务穿上一层"防弹衣"，告诉外部:"我正在干活，别打扰我"。
                 w.lock();
-
+                // 在准备执行一个任务之前，检查当前线程是否应该被中断。如果满足条件，就会调用wt.interrupt();来设置线程的中断标志。
+                // 这是为了配合线程池的shutdownNow()方法。当调用shutdownNow()时，线程池会进入STOP状态，并期望所有正在工作的线程尽快停止。
+                // 1、如果当前线程池的状态是STOP以上 且 wt不是打断状态 (wt.isInterrupted()不会清除中断标识)  第二个判断 的作用是 如果是中断，就不用重复中断了，也就没必要调用wt.interrupt()了
+                // 2、Thread.interrupted() 会获取线程中断状态并清除标识  这里仅仅知道这个状态是不够的，因为线程可能在正常运行时被意外中断，然后又被恢复。所以必须
+                // 再次确认，在线程池被中断的那个时间点之后，线程池的状态是否依然是STOP或更高。 因此这里的判断是 如果线程刚刚被清除了中断标志，并且现在线程池的状态仍然是STOP或者
+                // 更高，那么我们任务也需要中断。 为什么需要这一种复杂情况的判断
+                // 考虑一种场景: 线程池调用shutdownNow，将状态设置为STOP，并尝试中断所有工作线程。某个线程恰好此时被调度，它从任务队列取出了一个任务
+                // 在它执行之前，shutdownNow()的中断请求到达了，设置了它的中断标志。线程继续执行。进入我们看到if判断。如果只检查runStateAtLeast(ctl.get(), STOP)
+                // 可能会因为某些时序问题而失败(尽管可能性比较低)，然后进入(Thread.interrupted() &&
+                                                                      runStateAtLeast(ctl.get(), STOP)))
+                // 上面只判断Thread.interrupted() ，可能会误伤那些在正常状态下被中断又恢复的线程。 在&&后面的状态，是为了保证:只要是因为shutdownNow()导致的中断
+                // ，并且线程池确实处于关闭状态，就一定会触发wt.interrupt();从而保证线程能感知到中断并退出
                 if ((runStateAtLeast(ctl.get(), STOP) ||
                      (Thread.interrupted() &&
                       runStateAtLeast(ctl.get(), STOP))) &&
                     !wt.isInterrupted())
                     wt.interrupt();
                 try {
+                    // 某一个任务执行之前处理器 可以通过覆写本方法
                     beforeExecute(wt, task);
                     Throwable thrown = null;
                     try {
@@ -262,10 +275,16 @@ final void runWorker(Worker w) {
                     } catch (Throwable x) {
                         thrown = x; throw new Error(x);
                     } finally {
+                        // 某一个任务执行之后处理器 可以通过覆写本方法 这里如何获取执行的线程呢，可以通过在beforeExecute(wt, task)中将
+                        // wt传入到task中，这里从task中获取，这就要求我们的task要有一个保存线程的变量。
+                        // 定义一个父类 MyRunnable extend Runnable   有一个setThread 和一个getThread方法
+                        // 所有的任务类都实现MyRunnable即可
                         afterExecute(task, thrown);
                     }
                 } finally {
                     task = null;
+                    //这里的自增是线程安全的，因为一个 Worker对应一个线程
+                    // 那为什么还要用volatile修饰 是因为有其他线程做读取操作。
                     w.completedTasks++;
                     w.unlock();
                 }

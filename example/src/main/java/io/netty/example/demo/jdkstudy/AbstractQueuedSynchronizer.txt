@@ -151,7 +151,7 @@ static final long spinForTimeoutThreshold = 1000L;
         且这次已经释放锁了，能拿到锁了，就不会阻塞了。
 
 
-      线程的Thread.interrupted() 获取中断标记 + 清除中断位(用完变为false)
+      线程的Thread静态方法.interrupted() 获取中断标记 + 清除中断位(用完变为false)
            实例.interrupt() 发中断请求，设置线程中断标记为true，不会立刻停止线程
             Thread.isInterrupted()获取当前中断标记，不清除标志
 
