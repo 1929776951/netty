@@ -1,0 +1,191 @@
+Future接口提供获取结果的能力   Task 执行任务的能力
+如果Future和Task是两个独立的类，也确实是两个独立的接口，其实就是Future 和 Runnable ，如果任务执行完成后，还得想办法把结果跨对象传递给Future，
+这即麻烦又容易引发线程安全问题。
+所以就又设计了一个RunnableFuture接口，从名字就可以看出来 就有运行任务的能力也有future的功能
+这个接口又弄了一个实现类FutureTask 这样这个类就有了两个功能 运行任务和获取结果。
+那这两个功能是如何在这个类里面融合到一起的呢
+首先 它实现了runnable接口，有run方法，可以被线程池当成一个普通任务拿去执行。
+其次实现了future接口，对外暴露了get(),cancel()等
+当线程池调用FutureTask.run()方法时,线程池中的runWorker()方法会调用task的run方法，task其实就是FutureTask类型的。
+当run方法执行完毕后会在run方法中就将结果存储到FutureTask对象的outcome字段里，同时唤醒那些正在调用get()等待结果的线程。
+
+FutureTask本质上是一个"自带储物柜的工人"，工人(task)去干活，干完活直接把结果放进自己的储物柜(Future)中。外部不需要满世界找结果，只需要持有
+FutureTask对象的引用，调用get()方法(钥匙)去开柜门拿结果就行。
+
+任务的状态一共7种，
+private static final int NEW          = 0;  初始状态
+private static final int COMPLETING   = 1;  完成中
+为什么需要这个中间状态，而不是NEW直接到NORMAL，这里要重点说明一下
+我们看一下这个状态什么时候设置的
+protected void set(V v) {
+        if (UNSAFE.compareAndSwapInt(this, stateOffset, NEW, COMPLETING)) {
+            outcome = v;
+            UNSAFE.putOrderedInt(this, stateOffset, NORMAL); // final state
+            finishCompletion();
+        }
+    }
+是通过上面的代码设置的，上面的代码是在run方法执行最后调用的，这里考虑两个问题，1、为什么这个set方法是run方法中调用，run方法肯定会只有一个线程调用
+为什么会存在线程安全，需要cas操作 ？2、这里为什么要先设置成COMPLETING，然后再设置为NORMAL？
+先来看第一个问题，虽然set方法是只会在一个线程中调用，但是state变量可能会被多个线程操作，比如其他线程取消任务时，就会改变state状态，如果不cas操作
+，就会造成取消和这里的设置并发冲突。这里用cas来控制，set先来那就先设置结果，取消就失败，如果先cancel，那set就失败，这样用get获取结果的时候就报
+CancellationException
+第二个问题，如果我们直接改状态为NORMAL，outcome=v，这两部操作不是原子的，比如a、线程A执行任务，准备设置结果，b、outcome=result c、再cas将状态
+改为NORMAL。风险点在b和c之间，此时outcome已经有值了，但是状态还是NEW，如果有另一个线程B调用get()，发现状态还是NEW，就会进入等待状态。或者可能读取
+到了outcome的值，但是状态还不是NORMAL，导致一个"虽然写了但还没有被正式确认为完成"的结果。
+所以第一步先设置为COMPLETING，就向全世界宣告:我正在写结果，谁也别动。其他想取消的任务线程会发现状态不是NEW，从而放弃取消。其他想重复执行任务的线程
+也会失败。
+但是           outcome = v;
+              UNSAFE.putOrderedInt(this, stateOffset, NORMAL); // final state
+ 这两句代码可能被重排序，也就变成了，先设置状态，在给outcome赋值，也可能产生状态为NORMAL了，但是结果还是空
+    UNSAFE.putOrderedInt(...) 这个方法 会在这个方法之前增加一个StoreStore屏障， 语义是在这个写操作之前的所有普通写操作(这里是写入outcome)
+    必须全部刷新到主内存，才能执行当前的这个写操作。  这里使用这个SS屏障，保证了状态变为NORMAL的时候，outcome一定有值了。防止当另一个线程调用get()
+    方法时，它读取到state == NORMAL 时，读取outcome时一定有值，如果不用这个，CPU对改状态和outcome重排序的话，可能刚设置为NORMAL，另一个线程
+    调用get方法，其中判断 state == NORMAL ,读取outcome时可能读取到null或者旧值，产生严重bug
+     protected void set(V v) {
+         if (UNSAFE.compareAndSwapInt(this, stateOffset, NEW, COMPLETING)) {
+             outcome = v;
+             UNSAFE.putOrderedInt(this, stateOffset, NORMAL); // final state
+             finishCompletion();
+         }
+     }
+     UNSAFE.putOrderedInt 这个方法强制保证了，outcome=v这一步必须在UNSAFE.putOrderedInt(this, stateOffset, NORMAL)这一步之前完成
+
+
+     那这里为什么不使用 putIntVolatile方法呢，因为这个方法还会在其后插入StoreLoad屏障，就类似上面
+         普通读写指令---> StoreStore屏障--->volatile写--->StoreLoad屏障--->普通读写指令
+      这样，前后都会插入屏障。这样开销更大，性能更差，我们这里的实际需求是,我们并不关系finishCompletion();的操作是否会重排到UNSAFE.putOrderedInt(this, stateOffset, NORMAL);
+      这个操作之前，我们只关心"结果"必须在"状态"之前准备好。
+private static final int NORMAL       = 2;
+// EXCEPTIONAL 也是一种完成状态，是异常完成，outcome是Throwable  其赋值方式和上面的set方法类似 通过setException(Throwable t)
+
+private static final int EXCEPTIONAL  = 3;
+
+
+public boolean cancel(boolean mayInterruptIfRunning) {
+// 1、如果state != NEW 直接返回false 这一步是为了快速判断
+// 2、如果第一步判断是NEW，但是cas的时候 失败，说明这中间有其他线程操作了，这里直接返回false。
+        if (!(state == NEW &&
+              UNSAFE.compareAndSwapInt(this, stateOffset, NEW,
+                  mayInterruptIfRunning ? INTERRUPTING : CANCELLED)))
+            return false;
+// mayInterruptIfRunning 控制是否允许中断正在执行的任务线程。 如果true，允许中断，会尝试通过t.interrupt()，中断该线程。这并不保证
+// 任务一定会立即停止。它依赖于任务代码本身是否响应中断。
+// 如果false，不允许中断。也就是不会给当前线程设置中断标志，任务会按照原来逻辑正在执行完成，但是任务的最终状态会被标记为CANCELLED。
+// 为什么需要这个参数呢？因为java的中断机制是协作式的，不是抢占式的。你不能"强行杀死"一个线程，只能"请求"它停止。这参数设计哲学:把控制权交给开发者，
+// 而不是替你做决定。
+// 总结一句话: 传true的哈就相当于要使用t.interrupt打断线程，如果线程任务中有判断中断标志的话那就会真的中断，执行不完成，没有结果。如果未使用中断标志，还是正常跑完，结果状态为INTERRUPTED 跑完也不会要结果了，
+//  传false，就相当于任务还会正常跑完，只是结果不要了，结果的状态也设置为CANCELLED了。
+// 想象你在厨房做饭。 cancel(true)类似于，家长过来说 别做饭了，你如果有处理这个家长的信息，就直接停止做饭了，可能火也没有关闭，煤气也没关闭，如果没有处理家长这个信息，你还会继续做完。
+// cancel(false)类似于 家长说:做完再停止  那你会完成做饭，但是家长不会吃了。
+// 传true的时候，如果任务中有判断中断标志，可能还真的会打断任务，使任务不能正常完成执行。如果传false，任务还是正常要跑完，那么取消任务的意义在哪里，传false的取消和不取消都会跑完，那意义呢？
+// 线程池执行任务时,任务状态变更  是否new-->run()或者call()方法被调用-->出现异常或者正常完成设置为COMPLETING--->EXCEPTIONAL或者NORMAL
+// 如果已经开始run/call方法了，这个时候调用cancel(false)的意义，本质确实不能阻止run/call方法的指向性，代码会继续执行知道结束或者抛出异常。此时cancel(false)的操作的意义在于
+//"改变任务的最终身份"和"阻断后续依赖"。
+//  把"成功"变成了"打断/取消"，如果没有调用cancel(false)，任务跑完，状态变为NORMAL，调用get能拿到结果，调用isDone能返回true，如果调用了 获取结果的get不会拿到结果，而是抛出异常，拿结果的逻辑可以根据这个异常做进一步处理
+// 我们通常会在任务代码里面配合检查这个状态，如果没有这些状态就按察，确实cancel(false)没有意义，此时它就只能"屏蔽结果"
+// 还有一个时，你调用cancel后，阻塞的调用get()拿结果的线程会立刻苏醒，不需要傻等到任务正在完成。还有一个如果你有回调，也会立刻触发回调逻辑的执行，让业务流程迅速进入"异常处理"环节
+        try {    // in case call to interrupt throws exception
+            if (mayInterruptIfRunning) {
+                try {
+                    Thread t = runner;
+                    if (t != null)
+                        t.interrupt();
+                } finally { // final state
+                    UNSAFE.putOrderedInt(this, stateOffset, INTERRUPTED);
+                }
+            }
+        } finally {
+            finishCompletion();
+        }
+        return true;
+    }
+private static final int CANCELLED    = 4;
+private static final int INTERRUPTING = 5;
+private static final int INTERRUPTED  = 6;
+
+NEW -> COMPLETING -> NORMAL
+NEW -> COMPLETING -> EXCEPTIONAL
+NEW -> CANCELLED
+NEW -> INTERRUPTING -> INTERRUPTED
+
+
+// 在等待任务结果的线程链表中，移除那些已经超时或被中断的"无效节点"，以防止内存泄露 这个链表是在高并发环境下操作，没有使用synchronized
+// 当一个等待线程被中断或超时醒来后，它的node.thread会被置为null。这就表示这个节点"已失效"
+private void removeWaiter(WaitNode node) {
+        if (node != null) {
+        // 标记当前node为"已失效"，后续遍历链表时就知道这个节点没用了，可以删了。
+            node.thread = null;
+            retry:
+            // 在无锁编程中，当我们试图修改链表结构时，可能发现链表的结构已经被改的面目全非了。必须从头开始重新遍历，就需要用死循环。
+            for (;;) {          // restart on removeWaiter race
+            // q 当前要检查的节点   pred q的前驱，初始为null   s 为q的下一个节点。
+            // 这段循环的逻辑是从头节点开始，找到一个"有效节点"，赋值给pred，作为一个坚实的"锚点"，后面如果还能找到有效的节点，直接挂到这个后面，中间无效的就都被移除了
+            // q是头节点时，如果q有效，则"锚点"pred 为头节点，然后循环第二个节点，如果第二个节点存在会再次进入循环，判断q.thread !=null 是否成立，成立为有效，则"锚点"后移
+            // 也就是pred后移，如果第二个节点无效，此时pred不为空，将pred.next直接设置为当前循环的节点的下一个节点，这里是乐观操作，先赋值，然后判断是否有效，如果下一个节点
+            // 如果此时pred被其他线程取消了，这里做了二次判断，然后就重新循环链表。
+            // 这个方法就是要么完美执行，要么全盘推翻重来。
+                for (WaitNode pred = null, q = waiters, s; q != null; q = s) {
+                    s = q.next;
+                    if (q.thread != null)
+                        pred = q;
+                    else if (pred != null) {
+                    // 这一步会把当前的q删掉，如果下面判断pred.thread == null 然后重新循环，会处理掉pred，既然pred也是废的，也要删掉这个废物
+                        pred.next = s;
+                        if (pred.thread == null) // check for race
+                            continue retry;
+                    }
+                    // 这一行是专门处理头节点的情况的，头节点的操作必须用CAS方法，因为有并发问题，加入直接用waiter=s,而另一个线程刚好把waiters改成了新的头节点NewHead，我们的写入会把
+                    //NewHead覆盖掉，导致整个新分支的线程全部丢失。这是灾难性的。
+                    // 那为什么上面的pred.next=s不需要呢。我们假设另一个线程也在操作pred.next=s  A-->B-->C 假设线程1执行 A.next=C 此时另外一个线程2也想删除B 执行A.next=C 或者
+                    // A.next=C更后面的节点。 又或者你执行pred.next=s时，另外一个线程已经把pred修改了，你写入的值s通常也时链表正确演进方向上的节点。这种写入不会破坏链表的结构。只会
+                    //加速垃圾节点的清理。
+                    else if (!UNSAFE.compareAndSwapObject(this, waitersOffset,
+                                                          q, s))
+                        continue retry;
+                }
+                break;
+            }
+        }
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

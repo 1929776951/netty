@@ -19,7 +19,7 @@ poll方法 非阻塞 立即检查是否有已经完成的任务，不会等待�
     Volatile读操作的屏障策略，是在读之后，连续插入两道屏障
        a、LoadLoad屏障：禁止"后面的普通读"重排到"当前的volatile读"之前。确保线程必须先完成volatile变量的最新值读取，才能读取后续的普通变量
        b、LoadStore屏障: 禁止"后面的普通写"重排到"当前的volatile读"之前。确保线程必须先完成volatile变量的最新值读取，才能执行后续的普通变量写入操作
-    总结: volatile读之后的所有普通读写操作，绝对不能重排序都volatile读之前。
+    总结: volatile读之后的所有普通读写操作，绝对不能重排序到volatile读之前。
 
     普通读写指令---> volatile读--->LoadLoad屏障--->LoadStore屏障--->普通写--->普通读
 
