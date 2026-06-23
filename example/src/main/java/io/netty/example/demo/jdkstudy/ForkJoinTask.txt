@@ -1,0 +1,23 @@
+
+    volatile int status;
+    static final int DONE_MASK   = 0xf0000000;  // mask out non-completion bits
+    static final int NORMAL      = 0xf0000000;  // must be negative
+    static final int CANCELLED   = 0xc0000000;  // must be < NORMAL
+    static final int EXCEPTIONAL = 0x80000000;  // must be < CANCELLED
+    static final int SIGNAL      = 0x00010000;  // must be >= 1 << 16
+    static final int SMASK       = 0x0000ffff;  // short bits for tags
+
+0xf0000000
+11110000 00000000 00000000 00000000
+0xc0000000
+11000000 00000000 00000000 00000000
+0x80000000
+10000000 00000000 00000000 00000000
+0x00010000
+00000000 00000001 00000000 00000000
+0x0000ffff
+00000000 00000000 11111111 11111111
+
+NORMAL CANCELLED EXCEPTIONAL 均为负数，因此status < 0 可快速判断任务是否已完成(无需位运算)
+SIGNAL 信号位，位于第17位，用于标记"有线程在等待此任务完成"需唤醒等待者
+SMASK 标签掩码 提取低16位，用于存储用户自定义的任务标签。

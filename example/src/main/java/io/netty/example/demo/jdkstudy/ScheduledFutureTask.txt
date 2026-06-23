@@ -1,0 +1,2 @@
+private final long sequenceNumber;
+任务的全局唯一序号，用于在时间相同的任务之间打破平局，保证优先执行sequenceNumber更小的任务，确保调度的公平性和顺序性

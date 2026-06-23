@@ -148,14 +148,118 @@ private void removeWaiter(WaitNode node) {
         }
     }
 
+-----------------------------------------------------------
+下面说一下FutureTask的run方法和cancel(true)调用并发引起的线程状态，因线程会复用，这个线程状态污染下一个任务执行逻辑的坑
+
+public void run() {
+        if (state != NEW ||
+            !UNSAFE.compareAndSwapObject(this, runnerOffset,
+                                         null, Thread.currentThread()))
+            return;
+        try {
+            Callable<V> c = callable;
+            if (c != null && state == NEW) {
+                V result;
+                boolean ran;
+                try {
+                    result = c.call();
+                    ran = true;
+                } catch (Throwable ex) {
+                    result = null;
+                    ran = false;
+                    setException(ex);
+                }
+                if (ran)
+                    set(result);
+            }
+        } finally {
+            runner = null;
+            int s = state;
+            if (s >= INTERRUPTING)
+                handlePossibleCancellationInterrupt(s);
+        }
+    }
+
+public boolean cancel(boolean mayInterruptIfRunning) {
+        if (!(state == NEW &&
+              UNSAFE.compareAndSwapInt(this, stateOffset, NEW,
+                  mayInterruptIfRunning ? INTERRUPTING : CANCELLED)))
+            return false;
+        try {
+            if (mayInterruptIfRunning) {
+                try {
+                    Thread t = runner;
+                    if (t != null)
+                        t.interrupt();
+                } finally { // final state
+                    UNSAFE.putOrderedInt(this, stateOffset, INTERRUPTED);
+                }
+            }
+        } finally {
+            finishCompletion();
+        }
+        return true;
+    }
+
+
+上面是run方法和cancel(true)方法
+
+
+如果run方法中执行call()方法过程中，cancel(true)执行到了t.interrupt()此时线程的中断标志变为了true;   那么如果call方法中有处理中断的逻辑，
+并且也已经捕获到了这个中断异常，比如sleep，wait方法等，抛出异常后，中断标志会被清除，此时我们不需要做什么处理，如果call方法中没有处理中断的逻辑，
+那么call方法会正常走完，这个中断标记就会保留下来，在run方法的finally中不做处理，当前任务处理完成后，这个线程被复用处理另一个任务了，如果这个新任务
+中有一个判断中断标志的逻辑，那么获取的中断标志其实上一个任务遗留下的，会造成"中断泄露"
+但这里fun方法finally中有处理，我们看它会判断if (s >= INTERRUPTING)  但是再往里看handlePossibleCancellationInterrupt(s); 这个方法
+只是处理了INTERRUPTING状态，而没有处理INTERRUPTED状态。因为如果任务目前是INTERRUPTING状态，那么一定有其他线程调用了cancel(true)，但是cancel(true)
+方法也只是刚刚将状态改为INTERRUPTING，还未来得及调用t.interrupt()，如果此时run方法中的call方法已经执行完成了，finally中的handlePossibleCancellationInterrupt(s)
+方法此时循环INTERRUPTING状态，是为了确保cancel(true)状态的中断信号一定被发出来，然后run方法才能走完，才能接收下一个任务。如果不等，直接做下一个任务，有可能
+t.interrupt()还未执行前，就通过runWorker方法调用进了run方法。就没有机会清理这个中断标志了。我们看
+if ((runStateAtLeast(ctl.get(), STOP) ||
+                     (Thread.interrupted() &&
+                      runStateAtLeast(ctl.get(), STOP))) &&
+                    !wt.isInterrupted())
+                    这个是线程池的runWorker方法，开始调用任务run方法之前的一段逻辑，线程池有清除中断标记的逻辑，也就是Thread.interrupted() 这个会获取中断标志并清除
+ 如果不在run方法的finally中循环等待INTERRUPTING这个状态结束，没有完全达到一个INTERRUPTED(执行上一个任务的run方法最后等到这个状态，保证
+ 如果有t.interrupt就一定执行了)，runWorker可能就会存在清除不了中断，有可能"中断泄露"
+ 所以在futureTask的run方法最后没有通过Thread.interrupted()方法清除中断标志，因为它不能清除这个标记，可能业务系统还需要。
+ 但是在线程池执行此任务之前是处理了这个状态，也意味着，如果futureTask不是在线程池执行，我们开发使用时也不能忘记这个状态的处理，因为只有线程复用才会出现，如果不服用线程
+ 也不用考虑，但一般线程复用就是使用线程池，那么我们如果实现线程池，也要考虑这个问题。
+
+
+还有一个问题 run方法的finally中先将runner设置为null  也是有原因的 我们分析
+当前线程 执行runner = null，其他线程可能在任意时刻调用cancel(true)，尝试中断任务并修改state为INTERRUPTING/INTERRUPTED 这两个操作会产生竞态
+  如果state，后置置空runner，
+  会产生一种这种情况 第一步 执行线程读到state = NORMAL，
+                  第二步 其他线程立刻调用cancel(true)，把state改成了INTERRUPTING，并尝试中断runner线程。
+                  第三步 执行线程把runner = null
+                  那么runner释放后，其他任务就可以进来了，但是当前的线程读取到的是旧值，完全不知道发生了中断，中断信号就"泄露"了。
+          所以我们在将runner设置为null后，一定要判断下状态，如果状态还不知最终状态，比如>=INTERRUPTING，那么就调用handlePossibleCancellationInterrupt
+  去处理这个中断。其中通过Thread.yield()让出cpu执行权，让当前run方法在没有state达到最终状态下 不结束run方法。
+所以上面说的先将runner设置为null，再判断状态，这个问题本质 不是顺序问题，而是将runner设置为null后，还需要通过控制要等任务的状态走到终态。这里不死循环等状态走到终态的话，由于
+runner=null了，当前线程就能接收其他任务处理(run方法开始其实是判断这个runner的值来决定是不是要执行任务的，可以说runner是一个锁)，那么这个状态可能带到下一个任务，污染后面的任务
+
+如果不读，不自旋等待状态走到终态，get()会卡住，只要state == INTERRUPTING,get(),就会任务未完成，无线阻塞，可能你会认为cancel终会将状态走到最终，中间阻塞几百ms或者几秒
+不要紧，但是这在高并发下是灾难。
+其他线程调用isDone()/get()时，会自旋查state，状态卡的越久，CPU空转越严重，如果程序员不控制，这个就会空转更久，我们尽量避免
+中断标记泄露 这个上面已经说过了(下一个任务可以进来了，一调用sleep/wait/queue.take()，立刻抛出InterruptedException 完全莫名其妙
+
+finally中的注释，主要时为了"中断泄露"，不是为了推进状态。
+// state must be re-read after nulling runner to prevent
+            // leaked interrupts
 
 
 
+我们看到Executor接口中的execute方法只接收Runnable接口类型参数  但是submit方法可以接收runnable，也可以接收callable，底层调用的
+都是executor的execute，那怎么处理的呢，其实中间做了很多转换，就是把runnable和callable都转换成了FutureTask类型，而这个FutureTask又实现了Runnable
+，其中又包含了callable，外层传入的时候如果是runnable，那就在封装成futureTask的时候，将这个runnable转换成了callable，并赋值给了FutureTask的成员遍历callable类型
+正在执行的时候是用这个callable执行任务的
+如果外层传入的是callable，那就直接给callable的成员变量，不做转换。
+外层runnable接口类型不能改变，历史遗留问题，就搞一个中间FutureTask ，FutureTask实现runnable，能传递到execute方法中
+，然后futureTask中组合一个callable类型成员变量，底层实际执行的时候用这个成员变量，这样 就能兼容两种了，历史版本不用变化
+如果execute中的变量直接改了，就不兼容以前了。通过这种适配，做到了兼容。
 
-
-
-
-
+JDK5新增callable后，没有动顶层的execute方法，而是在子接口ExecutorService中用submit扩展新能力。 所有callable最终都会被包装为runnable(futureTask)
+，最终依然走execute执行。
 
 
 

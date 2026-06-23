@@ -1,0 +1,783 @@
+    // ForkJoinPool中的invoke、execute、submit方法都有什么区别
+    invoke 同步阻塞，等待并获取结果 当你提交一个顶层任务，并且必须等待该任务执行完成并获取其返回值，内部机制在语义上等价于task.fork()加上task.join()，
+    但通常会尝试在当前线程中直接开始执行，效率更高。在main函数或主线程
+    execute() 异步非阻塞 只需要触发任务执行，完全不需要获取返回值，也不关心任务何时结束
+    submit() 异步提交，后续手动获取结果
+
+
+    // 短位掩码 值为65535，用于提取索引的低16位，代表最大索引值，限制队列或任务索引范围
+    static final int SMASK        = 0xffff;        // short bits == max index
+    // 最大工作线程数-1 值为32767，即forkjoinpool最多支持32768个工作线程
+    static final int MAX_CAP      = 0x7fff;        // max #workers - 1
+    // 偶数短位掩码 用于过滤出偶数索引，保证索引为偶数
+    static final int EVENMASK     = 0xfffe;        // even short bits
+    // 最大64个(偶数)槽位掩码，值为126，用于限制队列槽位数量为64的倍数，是队列索引的位运算边界
+    static final int SQMASK       = 0x007e;        // max 64 (even) slots
+
+   // 扫描状态标记，值为1，表示线程正在空闲扫描任务，0时表示线程正在执行任务。
+    static final int SCANNING     = 1;             // false when running tasks
+    // 非活跃状态标记，时最高位为1的负数，用户标识线程池关闭或队列停用
+    static final int INACTIVE     = 1 << 31;       // must be negative
+    static final int SS_SEQ       = 1 << 16;       // version count
+
+    // Mode bits for ForkJoinPool.config and WorkQueue.config
+    static final int MODE_MASK    = 0xffff << 16;  // top half of int
+    static final int LIFO_QUEUE   = 0;
+    static final int FIFO_QUEUE   = 1 << 16;
+    static final int SHARED_QUEUE = 1 << 31;
+
+
+
+
+
+      // 工作窃取队列
+      static final class WorkQueue {
+        // 内部数组在初始化时的容量，2^13 即8192 必须是2的次幂，并且设置的比较大，是为了减少或消除不同队列之间的缓存行共享，从而避免伪共享带来的性能问题。
+        static final int INITIAL_QUEUE_CAPACITY = 1 << 13;
+
+        /**
+         * Maximum size for queue arrays. Must be a power of two less
+         * than or equal to 1 << (31 - width of array entry) to ensure
+         * lack of wraparound of index calculations, but defined to a
+         * value a bit less than this to help users trap runaway
+         * programs before saturating systems.
+         */
+        static final int MAXIMUM_QUEUE_CAPACITY = 1 << 26; // 64M
+
+        // 扫描状态 当值为负数(<0)时，表示该队列处于非活跃状态(其所属的工作线程已终止)
+        //当值为奇数时，表示有其他线程正在扫描此队列以窃取任务。这是一种简单的锁机制，防止多个线程同时从同一个队列窃取任务造成冲突
+        //这个值还包含一个版本号，用户处理ABA问题。
+        volatile int scanState;    // versioned, <0: inactive; odd:scanning
+        // ForkJoinPool中维护了一个由所有WorkQueue组成的栈或链表，以便于管理和遍历。stackPred存储了在这个结构中，当前队列的前一个队列的索引或引用。
+        int stackPred;             // pool stack (ctl) predecessor
+        // 记录从当前队列中被其他线程成功"窃取"的任务数量。
+        int nsteals;               // number of steals
+        // 当一个线程需要窃取任务时，它会随机选择一个目标队列。这个hint值可以帮助优化随机选择的过程，或者作为上次成功窃取的队列的索引的提示，以提高下次窃取的效率。
+        int hint;                  // randomization and stealer index hint
+        // 存储队列的配置信息，主要是其在池中的索引和模式
+        // 这个整数值通过位运算打包了多个信息，例如该队列在ForkJoinPool的队列数组中的索引。以及它是属于普通工作线程还是共享队列等。
+        int config;                // pool index and mode
+        // 队列的锁标志 值位1时，表示队列被锁定(例如，正在进行扩容或提交任务等操作)
+        // 值为负，表示队列需要终止，值为0表示队列处于正常，未锁定状态
+        volatile int qlock;        // 1: locked, < 0: terminate; else 0
+        // 指示下一个将被取出或窃取的任务在数组中的索引。
+        // 这是队列的"头部"，工作线程自己从top端取任务(LIFO,后进显出)，而其他线程则从base端窃取任务(FIFO,先进先出)。
+        volatile int base;         // index of next slot for poll
+        // 这是队列的"尾部"，指示下一个新任务将被压入的位置索引
+        int top;                   // index of next slot for push
+        // 实际存储任务的数组
+        // 这是一个ForkJoinTask 类型的数组。最初是未分配的，意味着它可能在第一次使用时才进行延迟初始化，以节省内存。
+        ForkJoinTask<?>[] array;   // the elements (initially unallocated)
+        // 指向创建并管理当前队列的ForkJoinPool实例 final类型的表示归属的线程池不会改变
+        final ForkJoinPool pool;   // the containing pool (may be null)
+        // 指向拥有此队列的工作线程。
+        // 如果当前队列时共享队列，这个值可能为空
+        final ForkJoinWorkerThread owner; // owning thread or null if shared
+        // 当队列所有者线程因等待任务而被挂起时，指向该线程的引用
+        // 当队列为空时，所有者线程可能会被阻塞以等待新任务。这个字段保存了被阻塞的线程，以便在其他地方唤醒。
+        // 大部分情况下 时owner，但是owner表静态关系，这里的parker是动态的，有阻塞时，才有值，共享队列的情况下这个值可能其他线程
+        // 假设一个共享队列，里面有任务。线程A(可能是某个Worker，也可能是外部线程)试图取处理这个共享队列的任务，发现暂时需要等待，它可能会把自己
+        // 注册为parker
+        volatile Thread parker;    // == owner during call to park; else null
+        volatile ForkJoinTask<?> currentJoin;  // task being joined in awaitJoin
+        volatile ForkJoinTask<?> currentSteal; // mainly used by helpStealer
+
+        WorkQueue(ForkJoinPool pool, ForkJoinWorkerThread owner) {
+            this.pool = pool;
+            this.owner = owner;
+            // Place indices in the center of array (that is not yet allocated)
+            base = top = INITIAL_QUEUE_CAPACITY >>> 1;
+        }
+
+        /**
+         * Returns an exportable index (used by ForkJoinWorkerThread).
+         */
+
+        // 从config变量中提取并返回当前工作线程在ForkJoinPool中的索引。
+        // config是一个状态标记变量，低16位存储了池索引信息
+        // 无符号右移一位，丢弃最低位(用于标记奇偶位) 得到最终的池索引
+        final int getPoolIndex() {
+            return (config & 0xffff) >>> 1; // ignore odd/even tag bit
+        }
+
+        /**
+         * Returns the approximate number of tasks in the queue.
+         */
+        final int queueSize() {
+            int n = base - top;       // non-owner callers must read base first
+            return (n >= 0) ? 0 : -n; // ignore transient negative
+        }
+
+        /**
+         * Provides a more accurate estimate of whether this queue has
+         * any tasks than does queueSize, by checking whether a
+         * near-empty queue has at least one unclaimed task.
+         */
+        final boolean isEmpty() {
+            ForkJoinTask<?>[] a; int n, m, s;
+            return ((n = base - (s = top)) >= 0 ||
+                    (n == -1 &&           // possibly one task
+                     ((a = array) == null || (m = a.length - 1) < 0 ||
+                      U.getObject
+                      (a, (long)((m & (s - 1)) << ASHIFT) + ABASE) == null)));
+        }
+
+        /**
+         * Pushes a task. Call only by owner in unshared queues.  (The
+         * shared-queue version is embedded in method externalPush.)
+         *
+         * @param task the task. Caller must ensure non-null.
+         * @throws RejectedExecutionException if array cannot be resized
+         */
+         // 当前方法 仅允许队列所属的工作线程(owner)调用，用于将新任务压入队列尾部
+         // 共享队列的入队逻辑在externalPush中
+        final void push(ForkJoinTask<?> task) {
+            ForkJoinTask<?>[] a; ForkJoinPool p;
+            int b = base, s = top, n;
+            // 检查队列底层数组是否存在，若为null说明队列已经被移除，直接忽略入队操作
+            if ((a = array) != null) {    // ignore if queue removed
+                // 数据长度是2的幂次方 减去一得到的是一个掩码 比如2^4=16 二进制为 10000  减去1后得到15 二进制为1111 这样就相当于一个
+                int m = a.length - 1;     // fenced write for task visibility
+                U.putOrderedObject(a, ((m & s) << ASHIFT) + ABASE, task);
+                U.putOrderedInt(this, QTOP, s + 1);
+                if ((n = s - b) <= 1) {
+                    if ((p = pool) != null)
+                        p.signalWork(p.workQueues, this);
+                }
+                else if (n >= m)
+                    growArray();
+            }
+        }
+
+        /**
+         * Initializes or doubles the capacity of array. Call either
+         * by owner or with lock held -- it is OK for base, but not
+         * top, to move while resizings are in progress.
+         */
+        final ForkJoinTask<?>[] growArray() {
+            ForkJoinTask<?>[] oldA = array;
+            int size = oldA != null ? oldA.length << 1 : INITIAL_QUEUE_CAPACITY;
+            if (size > MAXIMUM_QUEUE_CAPACITY)
+                throw new RejectedExecutionException("Queue capacity exceeded");
+            int oldMask, t, b;
+            ForkJoinTask<?>[] a = array = new ForkJoinTask<?>[size];
+            if (oldA != null && (oldMask = oldA.length - 1) >= 0 &&
+                (t = top) - (b = base) > 0) {
+                int mask = size - 1;
+                do { // emulate poll from old array, push to new array
+                    ForkJoinTask<?> x;
+                    int oldj = ((b & oldMask) << ASHIFT) + ABASE;
+                    int j    = ((b &    mask) << ASHIFT) + ABASE;
+                    x = (ForkJoinTask<?>)U.getObjectVolatile(oldA, oldj);
+                    if (x != null &&
+                        U.compareAndSwapObject(oldA, oldj, x, null))
+                        U.putObjectVolatile(a, j, x);
+                } while (++b != t);
+            }
+            return a;
+        }
+
+        /**
+         * Takes next task, if one exists, in LIFO order.  Call only
+         * by owner in unshared queues.
+         */
+        final ForkJoinTask<?> pop() {
+            ForkJoinTask<?>[] a; ForkJoinTask<?> t; int m;
+            if ((a = array) != null && (m = a.length - 1) >= 0) {
+                for (int s; (s = top - 1) - base >= 0;) {
+                    long j = ((m & s) << ASHIFT) + ABASE;
+                    if ((t = (ForkJoinTask<?>)U.getObject(a, j)) == null)
+                        break;
+                    if (U.compareAndSwapObject(a, j, t, null)) {
+                        U.putOrderedInt(this, QTOP, s);
+                        return t;
+                    }
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Takes a task in FIFO order if b is base of queue and a task
+         * can be claimed without contention. Specialized versions
+         * appear in ForkJoinPool methods scan and helpStealer.
+         */
+        final ForkJoinTask<?> pollAt(int b) {
+            ForkJoinTask<?> t; ForkJoinTask<?>[] a;
+            if ((a = array) != null) {
+                int j = (((a.length - 1) & b) << ASHIFT) + ABASE;
+                if ((t = (ForkJoinTask<?>)U.getObjectVolatile(a, j)) != null &&
+                    base == b && U.compareAndSwapObject(a, j, t, null)) {
+                    base = b + 1;
+                    return t;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Takes next task, if one exists, in FIFO order.
+         */
+        final ForkJoinTask<?> poll() {
+            ForkJoinTask<?>[] a; int b; ForkJoinTask<?> t;
+            while ((b = base) - top < 0 && (a = array) != null) {
+                int j = (((a.length - 1) & b) << ASHIFT) + ABASE;
+                t = (ForkJoinTask<?>)U.getObjectVolatile(a, j);
+                if (base == b) {
+                    if (t != null) {
+                        if (U.compareAndSwapObject(a, j, t, null)) {
+                            base = b + 1;
+                            return t;
+                        }
+                    }
+                    else if (b + 1 == top) // now empty
+                        break;
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Takes next task, if one exists, in order specified by mode.
+         */
+        final ForkJoinTask<?> nextLocalTask() {
+            return (config & FIFO_QUEUE) == 0 ? pop() : poll();
+        }
+
+        /**
+         * Returns next task, if one exists, in order specified by mode.
+         */
+        final ForkJoinTask<?> peek() {
+            ForkJoinTask<?>[] a = array; int m;
+            if (a == null || (m = a.length - 1) < 0)
+                return null;
+            int i = (config & FIFO_QUEUE) == 0 ? top - 1 : base;
+            int j = ((i & m) << ASHIFT) + ABASE;
+            return (ForkJoinTask<?>)U.getObjectVolatile(a, j);
+        }
+
+        /**
+         * Pops the given task only if it is at the current top.
+         * (A shared version is available only via FJP.tryExternalUnpush)
+        */
+        final boolean tryUnpush(ForkJoinTask<?> t) {
+            ForkJoinTask<?>[] a; int s;
+            if ((a = array) != null && (s = top) != base &&
+                U.compareAndSwapObject
+                (a, (((a.length - 1) & --s) << ASHIFT) + ABASE, t, null)) {
+                U.putOrderedInt(this, QTOP, s);
+                return true;
+            }
+            return false;
+        }
+
+        /**
+         * Removes and cancels all known tasks, ignoring any exceptions.
+         */
+        final void cancelAll() {
+            ForkJoinTask<?> t;
+            if ((t = currentJoin) != null) {
+                currentJoin = null;
+                ForkJoinTask.cancelIgnoringExceptions(t);
+            }
+            if ((t = currentSteal) != null) {
+                currentSteal = null;
+                ForkJoinTask.cancelIgnoringExceptions(t);
+            }
+            while ((t = poll()) != null)
+                ForkJoinTask.cancelIgnoringExceptions(t);
+        }
+
+        // Specialized execution methods
+
+        /**
+         * Polls and runs tasks until empty.
+         */
+        final void pollAndExecAll() {
+            for (ForkJoinTask<?> t; (t = poll()) != null;)
+                t.doExec();
+        }
+
+        /**
+         * Removes and executes all local tasks. If LIFO, invokes
+         * pollAndExecAll. Otherwise implements a specialized pop loop
+         * to exec until empty.
+         */
+        final void execLocalTasks() {
+            int b = base, m, s;
+            ForkJoinTask<?>[] a = array;
+            if (b - (s = top - 1) <= 0 && a != null &&
+                (m = a.length - 1) >= 0) {
+                if ((config & FIFO_QUEUE) == 0) {
+                    for (ForkJoinTask<?> t;;) {
+                        if ((t = (ForkJoinTask<?>)U.getAndSetObject
+                             (a, ((m & s) << ASHIFT) + ABASE, null)) == null)
+                            break;
+                        U.putOrderedInt(this, QTOP, s);
+                        t.doExec();
+                        if (base - (s = top - 1) > 0)
+                            break;
+                    }
+                }
+                else
+                    pollAndExecAll();
+            }
+        }
+
+        /**
+         * Executes the given task and any remaining local tasks.
+         */
+        final void runTask(ForkJoinTask<?> task) {
+            if (task != null) {
+                scanState &= ~SCANNING; // mark as busy
+                (currentSteal = task).doExec();
+                U.putOrderedObject(this, QCURRENTSTEAL, null); // release for GC
+                execLocalTasks();
+                ForkJoinWorkerThread thread = owner;
+                if (++nsteals < 0)      // collect on overflow
+                    transferStealCount(pool);
+                scanState |= SCANNING;
+                if (thread != null)
+                    thread.afterTopLevelExec();
+            }
+        }
+
+        /**
+         * Adds steal count to pool stealCounter if it exists, and resets.
+         */
+        final void transferStealCount(ForkJoinPool p) {
+            AtomicLong sc;
+            if (p != null && (sc = p.stealCounter) != null) {
+                int s = nsteals;
+                nsteals = 0;            // if negative, correct for overflow
+                sc.getAndAdd((long)(s < 0 ? Integer.MAX_VALUE : s));
+            }
+        }
+
+        /**
+         * If present, removes from queue and executes the given task,
+         * or any other cancelled task. Used only by awaitJoin.
+         *
+         * @return true if queue empty and task not known to be done
+         */
+        final boolean tryRemoveAndExec(ForkJoinTask<?> task) {
+            ForkJoinTask<?>[] a; int m, s, b, n;
+            if ((a = array) != null && (m = a.length - 1) >= 0 &&
+                task != null) {
+                while ((n = (s = top) - (b = base)) > 0) {
+                    for (ForkJoinTask<?> t;;) {      // traverse from s to b
+                        long j = ((--s & m) << ASHIFT) + ABASE;
+                        if ((t = (ForkJoinTask<?>)U.getObject(a, j)) == null)
+                            return s + 1 == top;     // shorter than expected
+                        else if (t == task) {
+                            boolean removed = false;
+                            if (s + 1 == top) {      // pop
+                                if (U.compareAndSwapObject(a, j, task, null)) {
+                                    U.putOrderedInt(this, QTOP, s);
+                                    removed = true;
+                                }
+                            }
+                            else if (base == b)      // replace with proxy
+                                removed = U.compareAndSwapObject(
+                                    a, j, task, new EmptyTask());
+                            if (removed)
+                                task.doExec();
+                            break;
+                        }
+                        else if (t.status < 0 && s + 1 == top) {
+                            if (U.compareAndSwapObject(a, j, t, null))
+                                U.putOrderedInt(this, QTOP, s);
+                            break;                  // was cancelled
+                        }
+                        if (--n == 0)
+                            return false;
+                    }
+                    if (task.status < 0)
+                        return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * Pops task if in the same CC computation as the given task,
+         * in either shared or owned mode. Used only by helpComplete.
+         */
+        final CountedCompleter<?> popCC(CountedCompleter<?> task, int mode) {
+            int s; ForkJoinTask<?>[] a; Object o;
+            if (base - (s = top) < 0 && (a = array) != null) {
+                long j = (((a.length - 1) & (s - 1)) << ASHIFT) + ABASE;
+                if ((o = U.getObjectVolatile(a, j)) != null &&
+                    (o instanceof CountedCompleter)) {
+                    CountedCompleter<?> t = (CountedCompleter<?>)o;
+                    for (CountedCompleter<?> r = t;;) {
+                        if (r == task) {
+                            if (mode < 0) { // must lock
+                                if (U.compareAndSwapInt(this, QLOCK, 0, 1)) {
+                                    if (top == s && array == a &&
+                                        U.compareAndSwapObject(a, j, t, null)) {
+                                        U.putOrderedInt(this, QTOP, s - 1);
+                                        U.putOrderedInt(this, QLOCK, 0);
+                                        return t;
+                                    }
+                                    U.compareAndSwapInt(this, QLOCK, 1, 0);
+                                }
+                            }
+                            else if (U.compareAndSwapObject(a, j, t, null)) {
+                                U.putOrderedInt(this, QTOP, s - 1);
+                                return t;
+                            }
+                            break;
+                        }
+                        else if ((r = r.completer) == null) // try parent
+                            break;
+                    }
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Steals and runs a task in the same CC computation as the
+         * given task if one exists and can be taken without
+         * contention. Otherwise returns a checksum/control value for
+         * use by method helpComplete.
+         *
+         * @return 1 if successful, 2 if retryable (lost to another
+         * stealer), -1 if non-empty but no matching task found, else
+         * the base index, forced negative.
+         */
+        final int pollAndExecCC(CountedCompleter<?> task) {
+            int b, h; ForkJoinTask<?>[] a; Object o;
+            if ((b = base) - top >= 0 || (a = array) == null)
+                h = b | Integer.MIN_VALUE;  // to sense movement on re-poll
+            else {
+                long j = (((a.length - 1) & b) << ASHIFT) + ABASE;
+                if ((o = U.getObjectVolatile(a, j)) == null)
+                    h = 2;                  // retryable
+                else if (!(o instanceof CountedCompleter))
+                    h = -1;                 // unmatchable
+                else {
+                    CountedCompleter<?> t = (CountedCompleter<?>)o;
+                    for (CountedCompleter<?> r = t;;) {
+                        if (r == task) {
+                            if (base == b &&
+                                U.compareAndSwapObject(a, j, t, null)) {
+                                base = b + 1;
+                                t.doExec();
+                                h = 1;      // success
+                            }
+                            else
+                                h = 2;      // lost CAS
+                            break;
+                        }
+                        else if ((r = r.completer) == null) {
+                            h = -1;         // unmatched
+                            break;
+                        }
+                    }
+                }
+            }
+            return h;
+        }
+
+        /**
+         * Returns true if owned and not known to be blocked.
+         */
+        final boolean isApparentlyUnblocked() {
+            Thread wt; Thread.State s;
+            return (scanState >= 0 &&
+                    (wt = owner) != null &&
+                    (s = wt.getState()) != Thread.State.BLOCKED &&
+                    s != Thread.State.WAITING &&
+                    s != Thread.State.TIMED_WAITING);
+        }
+
+        // Unsafe mechanics. Note that some are (and must be) the same as in FJP
+        private static final sun.misc.Unsafe U;
+        private static final int  ABASE;
+        private static final int  ASHIFT;
+        private static final long QTOP;
+        private static final long QLOCK;
+        private static final long QCURRENTSTEAL;
+        static {
+            try {
+                U = sun.misc.Unsafe.getUnsafe();
+                Class<?> wk = WorkQueue.class;
+                Class<?> ak = ForkJoinTask[].class;
+                QTOP = U.objectFieldOffset
+                    (wk.getDeclaredField("top"));
+                QLOCK = U.objectFieldOffset
+                    (wk.getDeclaredField("qlock"));
+                QCURRENTSTEAL = U.objectFieldOffset
+                    (wk.getDeclaredField("currentSteal"));
+                ABASE = U.arrayBaseOffset(ak);
+                int scale = U.arrayIndexScale(ak);
+                if ((scale & (scale - 1)) != 0)
+                    throw new Error("data type scale not a power of two");
+                ASHIFT = 31 - Integer.numberOfLeadingZeros(scale);
+            } catch (Exception e) {
+                throw new Error(e);
+            }
+        }
+    }
+
+
+
+
+
+--------------从一个数的二进制形式中，如何判断一个数是偶数还是奇数-------------
+在二进制中，判断一个数是不是奇数，只需要看这个数的最低位(最右边一位)是0还是1
+原理解释
+ 二进制的每一位代表的是2的幂次方， 从右往左数，第一位是2^0=1
+ 第二位2^1=2  第三位2^2=4 ... 依次类推，除了第一位2^0=1以外,其他所有位都是偶数 2，4，8，16.因此一个数是偶数还是奇数，完全取决于它有没有包含1这一项
+ 也就是最后一位是不是1，因为是1的话 转10进制的时候就要加上1*2^0   这样就是偶数，如果是0的话，就不加，就完全是偶数相加 肯定结果是偶数
+
+
+ 位运算判断 一个数if((num & 1) == 1 ) 奇数 else 偶数
+ num &1 的作用就是把除了最低位以外的所有位都变成0，只保留最低位。这种方法比使用取模运算 在底层执行效率高
+---------------------------------------------------------------------------------------
+
+
+
+-------------------------------------------------------------------------------------
+当数组的长度N是2的幂次方时,index&(N-1)等价于index%N
+十进制中，我们对10取模(%10)，其实就是取这个数的个位数
+同理，在二进制中，对2^n取模，本质上就是取这个数二进制的低n位
+比如一个数据长度N = 2^3=8 我们要计算13%8
+13的二进制时1101.最高位1000 代表8 8除以8余数是0.低位的101代表5，5除以8是5。所以13对8取模的结果，完全由它的低三位决定。
+我们要求低三位，可以使用一个掩码 来保留一个二进制的低三位 这个掩码的值就是2^3-1=7 也就是0111 这个7的低三位是111，1101&0111正好可以保留低三位，
+也就是要求的模。
+-------------------------------------------------------------------------------------
+
+
+--------------------------------------------------------------------------------------------
+// 这段代码利用Unsafe类直接操作内存偏移量，以实现高性能的并发任务调度。其核心目的是预计算关键字段的内存地址偏移量和数据索引的位移量，从而在
+//运行时避免反射或重复计算，提升任务入队，出队和窃取操作的效率。
+        private static final sun.misc.Unsafe U;
+        private static final int  ABASE;
+        private static final int  ASHIFT;
+        private static final long QTOP;
+        private static final long QLOCK;
+        private static final long QCURRENTSTEAL;
+        static {
+            try {
+                U = sun.misc.Unsafe.getUnsafe();
+                Class<?> wk = WorkQueue.class;
+                Class<?> ak = ForkJoinTask[].class;
+                QTOP = U.objectFieldOffset
+                    (wk.getDeclaredField("top"));
+                QLOCK = U.objectFieldOffset
+                    (wk.getDeclaredField("qlock"));
+                QCURRENTSTEAL = U.objectFieldOffset
+                    (wk.getDeclaredField("currentSteal"));
+                ABASE = U.arrayBaseOffset(ak);
+                // 返回数组中每个元素占用的字节数(例如，64位系统上引用类型通常时8字节)
+                // 为了快速计算第i个元素的内存地址，我们希望用位移代替乘法 乘法计算:address = base + i * scale
+                // 代替乘法的计算方法就是 address = base + i << ASHIFT
+                int scale = U.arrayIndexScale(ak);
+                if ((scale & (scale - 1)) != 0)
+                    throw new Error("data type scale not a power of two");
+                    // 比如scale为16时，前导0的个数为32-5 = 27
+                    00000000 00000000 00000000 00010000
+                    // 31-27就是4 也就是计算scale对2的对数是多少 这里是4
+                ASHIFT = 31 - Integer.numberOfLeadingZeros(scale);
+            } catch (Exception e) {
+                throw new Error(e);
+            }
+        }
+
+
+
+
+           public static int numberOfLeadingZeros(int i) {
+                // HD, Figure 5-6
+                if (i == 0)
+                    return 32;
+                int n = 1;
+                // 无符号右移动16位，这步操作把高16位移到了低16位的位置。如果结果是0，说明最高的1肯定在低16位里。我们将i左移16位，低16位就变成了高16位
+                // 前导零的个数就要增加16，如果不为0，说明最高的1就在高16位里。此时高16位就是我们要分析的区域
+                // 这样无论第一个if判断是否成立，第二个if判断都是判断i的高8位，如果右移24位，就是0了，说明n又要加上8，然后i左移8位
+                if (i >>> 16 == 0) { n += 16; i <<= 16; }
+                if (i >>> 24 == 0) { n +=  8; i <<=  8; }
+                if (i >>> 28 == 0) { n +=  4; i <<=  4; }
+                if (i >>> 30 == 0) { n +=  2; i <<=  2; }
+                n -= i >>> 31;
+                return n;
+            }
+
+-----------------------------------------------------------------------------------------------------
+
+// 当一个外部线程(非ForkJoinPool内部的工作线程)提交任务时，尝试将任务快速放入某个队列中。这是一个"乐观"的快速路径,如果失败，会回退到更慢的通用
+//提交逻辑externalSubmit
+final void externalPush(ForkJoinTask<?> task) {
+        WorkQueue[] ws; WorkQueue q; int m;
+        // 获取当前线程的哈希值(探针)，为了决定把任务扔到哪个队列里，尽量让不同的线程分散到不同的队列，减少冲突。
+        int r = ThreadLocalRandom.getProbe();
+        // 读取线程池当前的状态
+        int rs = runState;
+        // 首次调用这个方法时这个workQueues为空，这个if判断不成立，会走到下面的externalSubmit
+        if ((ws = workQueues) != null && (m = (ws.length - 1)) >= 0 &&
+            (q = ws[m & r & SQMASK]) != null && r != 0 && rs > 0 &&
+            U.compareAndSwapInt(q, QLOCK, 0, 1)) {
+            ForkJoinTask<?>[] a; int am, n, s;
+            if ((a = q.array) != null &&
+                (am = a.length - 1) > (n = (s = q.top) - q.base)) {
+                int j = ((am & s) << ASHIFT) + ABASE;
+                U.putOrderedObject(a, j, task);
+                U.putOrderedInt(q, QTOP, s + 1);
+                U.putIntVolatile(q, QLOCK, 0);
+                if (n <= 1)
+                    signalWork(ws, q);
+                return;
+            }
+            U.compareAndSwapInt(q, QLOCK, 1, 0);
+        }
+        externalSubmit(task);
+    }
+
+
+// 该方法用于处理外部线程(非ForkJoinWorkerThread)向线程池提交任务的场景
+// 处理不常见的情况(如线程池未初始化、已关闭等)
+// 在首次提交任务时执行二次初始化(如创建共享队列、启动工作线程)等其他
+
+private void externalSubmit(ForkJoinTask<?> task) {
+        int r;
+        //当前线程还没有在ThreadLocalRandom体系中生产并绑定过probe值，不是指线程本身还没启动。
+        if ((r = ThreadLocalRandom.getProbe()) == 0) {
+            ThreadLocalRandom.localInit();
+            r = ThreadLocalRandom.getProbe();
+        }
+        for (;;) {
+            WorkQueue[] ws; WorkQueue q; int rs, m, k;
+            boolean move = false;
+            if ((rs = runState) < 0) {
+                tryTerminate(false, false);     // help terminate
+                throw new RejectedExecutionException();
+            }
+            // rs & STARTED == 0  STARTED 的值为 00000000 00000000 00000000 00000100
+            // 如果一个数按位与STARTED  只有当低三这个位置是1的时候，才不是0，所以如果状态值rs中低三位这个位置上的值为1 就是STARTED状态
+            // 1 状态不是STARTED
+            // 2 状态是STARTED 但工作队列为空
+            // 3 状态是STARTED  工作队列不为空  工作队列的长度为0 这里要这么写 是为了给m赋值，下面要用 长度总是2的幂次方，减去1得到m 用来做掩码
+            else if ((rs & STARTED) == 0 ||     // initialize
+                     ((ws = workQueues) == null || (m = ws.length - 1) < 0)) {
+                int ns = 0;
+                rs = lockRunState();
+                try {
+                    if ((rs & STARTED) == 0) {
+                        U.compareAndSwapObject(this, STEALCOUNTER, null,
+                                               new AtomicLong());
+                        // create workQueues array with size a power of two
+                        int p = config & SMASK; // ensure at least 2 slots
+                        int n = (p > 1) ? p - 1 : 1;
+                        n |= n >>> 1; n |= n >>> 2;  n |= n >>> 4;
+                        n |= n >>> 8; n |= n >>> 16; n = (n + 1) << 1;
+                        workQueues = new WorkQueue[n];
+                        ns = STARTED;
+                    }
+                } finally {
+                    unlockRunState(rs, (rs & ~RSLOCK) | ns);
+                }
+            }
+            else if ((q = ws[k = r & m & SQMASK]) != null) {
+                if (q.qlock == 0 && U.compareAndSwapInt(q, QLOCK, 0, 1)) {
+                    ForkJoinTask<?>[] a = q.array;
+                    int s = q.top;
+                    boolean submitted = false; // initial submission or resizing
+                    try {                      // locked version of push
+                        if ((a != null && a.length > s + 1 - q.base) ||
+                            (a = q.growArray()) != null) {
+                            int j = (((a.length - 1) & s) << ASHIFT) + ABASE;
+                            U.putOrderedObject(a, j, task);
+                            U.putOrderedInt(q, QTOP, s + 1);
+                            submitted = true;
+                        }
+                    } finally {
+                        U.compareAndSwapInt(q, QLOCK, 1, 0);
+                    }
+                    if (submitted) {
+                        signalWork(ws, q);
+                        return;
+                    }
+                }
+                move = true;                   // move on failure
+            }
+            else if (((rs = runState) & RSLOCK) == 0) { // create new queue
+                q = new WorkQueue(this, null);
+                q.hint = r;
+                q.config = k | SHARED_QUEUE;
+                q.scanState = INACTIVE;
+                rs = lockRunState();           // publish index
+                if (rs > 0 &&  (ws = workQueues) != null &&
+                    k < ws.length && ws[k] == null)
+                    ws[k] = q;                 // else terminated
+                unlockRunState(rs, rs & ~RSLOCK);
+            }
+            else
+                move = true;                   // move if busy
+            if (move)
+                r = ThreadLocalRandom.advanceProbe(r);
+        }
+    }
+
+
+    private int lockRunState() {
+        int rs;
+        // 先判断当前runState & RSLOCK 是否等于0
+        // 如果不等于0 说明又其他线程获取到了锁，然后进入awaitRunStateLock()
+        // 如果等于0 说明没有锁，尝试U.compareAndSwapInt(this, RUNSTATE, rs, rs |= RSLOCK) 设置rs中锁标志位，如果设置成功 返回
+        //        如果设置失败，一样进入awaitRunStateLock()
+        //
+        return ((((rs = runState) & RSLOCK) != 0 ||
+                 !U.compareAndSwapInt(this, RUNSTATE, rs, rs |= RSLOCK)) ?
+                awaitRunStateLock() : rs);
+    }
+
+
+    private int awaitRunStateLock() {
+            Object lock;
+            boolean wasInterrupted = false;
+            // 下面这个for循环是死循环 初始化了spins r  定义了rs ns 没有赋值也是0
+            for (int spins = SPINS, r = 0, rs, ns;;) {
+                // 优先判断 赋值runState给rs 再按位与RSLOCK 判断当前的runState状态是不是已经有锁了
+                // 如果没有锁，进入下一个if 用cas的方式修改rs的值为有锁 如果修改成功就返回
+                // 如果有锁进入下一个else if
+                if (((rs = runState) & RSLOCK) == 0) {
+                    if (U.compareAndSwapInt(this, RUNSTATE, rs, ns = rs | RSLOCK)) {
+                        if (wasInterrupted) {
+                            try {
+                                Thread.currentThread().interrupt();
+                            } catch (SecurityException ignore) {
+                            }
+                        }
+                        return ns;
+                    }
+                }
+                // 第一次走到这里的时候r == 0  给r赋值一个随机种子
+                else if (r == 0)
+                    r = ThreadLocalRandom.nextSecondarySeed();
+                else if (spins > 0) {
+                    r ^= r << 6; r ^= r >>> 21; r ^= r << 7; // xorshift
+                    if (r >= 0)
+                        --spins;
+                }
+                else if ((rs & STARTED) == 0 || (lock = stealCounter) == null)
+                    Thread.yield();   // initialization race
+                else if (U.compareAndSwapInt(this, RUNSTATE, rs, rs | RSIGNAL)) {
+                    synchronized (lock) {
+                        if ((runState & RSIGNAL) != 0) {
+                            try {
+                                lock.wait();
+                            } catch (InterruptedException ie) {
+                                if (!(Thread.currentThread() instanceof
+                                      ForkJoinWorkerThread))
+                                    wasInterrupted = true;
+                            }
+                        }
+                        else
+                            lock.notifyAll();
+                    }
+                }
+            }
+        }
