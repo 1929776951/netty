@@ -637,13 +637,14 @@ final void externalPush(ForkJoinTask<?> task) {
     }
 
 
-// 该方法用于处理外部线程(非ForkJoinWorkerThread)向线程池提交任务的场景
+// 该方法用于处理外部线程(非ForkJoinWorkerThread)向线程池提交任务的场景，
 // 处理不常见的情况(如线程池未初始化、已关闭等)
 // 在首次提交任务时执行二次初始化(如创建共享队列、启动工作线程)等其他
 
 private void externalSubmit(ForkJoinTask<?> task) {
         int r;
         //当前线程还没有在ThreadLocalRandom体系中生产并绑定过probe值，不是指线程本身还没启动。
+        // 外部提交任务时，为了避免所有外部线程都往同一个队列里塞任务导致竞争，JDK使用这个随机数来哈希计算应该将任务放入哪个队列槽位。
         if ((r = ThreadLocalRandom.getProbe()) == 0) {
             ThreadLocalRandom.localInit();
             r = ThreadLocalRandom.getProbe();
@@ -651,6 +652,7 @@ private void externalSubmit(ForkJoinTask<?> task) {
         for (;;) {
             WorkQueue[] ws; WorkQueue q; int rs, m, k;
             boolean move = false;
+            // 快速失败与协助终止。如果线程池已经关闭，直接抛出拒绝异常。
             if ((rs = runState) < 0) {
                 tryTerminate(false, false);     // help terminate
                 throw new RejectedExecutionException();
@@ -669,10 +671,45 @@ private void externalSubmit(ForkJoinTask<?> task) {
                         U.compareAndSwapObject(this, STEALCOUNTER, null,
                                                new AtomicLong());
                         // create workQueues array with size a power of two
+                        //config中有高位存储的mode  按位与SMASK 过滤掉高位的值，只得到低位 也就是并行度的值
                         int p = config & SMASK; // ensure at least 2 slots
+                        // 找到一个大于或等于p的最小的2的幂次方(Power of Two)
+                        // 简单来说 无论传入的并行度p是多少(比如 3、5、7、9)经过这几行代码计算后，n都会变成4、8、8、16
+                        // 如果p是5 则n变为4(二进制 0000 0100)
+                        // 为什么要减去1，是为了处理p本身就是2的幂次方的情况，如果p是4，不减去1的话，最后结果会变成8，这就浪费了空间。
+
                         int n = (p > 1) ? p - 1 : 1;
+                        比如一个数19 它的二进制是10011  第一次右移1位
+                        10011
+                       &01001
+                       ------------
+                        11011     到这里一步 我们看到将1的下一位变成1  就有两位11了
+                        再右移2位
+                       &00110
+                       -----------
+                       11111   到这里一步  我们看到前面4位都是1了，后面再有移动8位 就是重复了 最终会把这个数从第一个1开始 后面的位全部变成1
+                       然后n+1 会将这些1的位全部变成0，再多一位是1  这样得到1 后面全是0，这是一个2的幂次放的数，也就是离n最近的2的幂次方
+                       再左移一位就是再乘以2
+                       这个队列的大小最终是 取离n的最近的2的幂次方的数的2倍
+
+
                         n |= n >>> 1; n |= n >>> 2;  n |= n >>> 4;
                         n |= n >>> 8; n |= n >>> 16; n = (n + 1) << 1;
+
+                        求一个数的最近的2的幂次方的另一个方法  找到二进制第一个1(最高位的1)，后面所有位清0，再往前一位补个1，就是大于等于原数的最小的2的幂次。
+
+                        Integer 类的highestOneBit方法也大致是这个实现
+
+                        public static int highestOneBit(int i) {
+                                // HD, Figure 3-1
+                                i |= (i >>  1);
+                                i |= (i >>  2);
+                                i |= (i >>  4);
+                                i |= (i >>  8);
+                                i |= (i >> 16);
+                                到这里的时候i的值位从第一位1(最高位1)，后面全部都变成1  然后减去右移1位后的数，得到只有最高位为1的数值。
+                                return i - (i >>> 1);
+                            }
                         workQueues = new WorkQueue[n];
                         ns = STARTED;
                     }
@@ -680,10 +717,20 @@ private void externalSubmit(ForkJoinTask<?> task) {
                     unlockRunState(rs, (rs & ~RSLOCK) | ns);
                 }
             }
+            这里的k = r & m & SQMASK 解释
+            r & m  其实就是:m=N-1 当数组的长度N是2的幂次方时,r&(N-1)等价于r%N  也就是将r映射到[0,m]范围内。得到候选队列索引
+            & SQMASK 进一步约束范围 SQMASK = 0x007e 二进制为00000000 01111110 按位与运算会 屏蔽索引的高位(>6位的部分全部置0) 屏蔽索引的第0位(最低位置为0)
+             保留索引的第1--6 位，这6位可表示2^6=64个不同值 每一位都有0和1 两种可能，6位就是6个2乘
+             索引被限制在偶数范围内，因为第0位是0.
             else if ((q = ws[k = r & m & SQMASK]) != null) {
+                // 如果当前线程计算出来的队列不为空 ，查看队列的自旋锁标识是否已锁 0 未锁 1 已锁
+                // 如果没有加锁，则通过cas加锁 加锁成功进入if逻辑
                 if (q.qlock == 0 && U.compareAndSwapInt(q, QLOCK, 0, 1)) {
+                    // 队列的底层任务数组
                     ForkJoinTask<?>[] a = q.array;
+                    队列的栈顶指针  workQueue是双端队列，top指向栈顶，base指向栈底
                     int s = q.top;
+                    // 标记任务是否成功入队
                     boolean submitted = false; // initial submission or resizing
                     try {                      // locked version of push
                         if ((a != null && a.length > s + 1 - q.base) ||
@@ -758,12 +805,31 @@ private void externalSubmit(ForkJoinTask<?> task) {
                 else if (r == 0)
                     r = ThreadLocalRandom.nextSecondarySeed();
                 else if (spins > 0) {
+                    // xorshift算法
                     r ^= r << 6; r ^= r >>> 21; r ^= r << 7; // xorshift
                     if (r >= 0)
                         --spins;
                 }
+                // 这里判断如果是还没有STARTED状态，或者任务窃取计数器stealCounter，也就是lock对象可能还没有完全初始化
+                // 如果线程池还每完全准备好，也就是还不是STARTED或者锁对象还没有生产，当前线程争抢锁是没有意义的，甚至会导致空指针异常。
+                // 这里用stealCounter作为监视器，比专门创建一个new Object()仅仅用来做锁更优，因为stealCounter的生命周期和线程池一致
+                // 就是完美的"锁对象"候选人
                 else if ((rs & STARTED) == 0 || (lock = stealCounter) == null)
+                    // 既然还没有准备好，那我就先让出CPU时间片，稍后再试。这是一种轻量级的等待策略，避免在初始化阶段进行昂贵的同步操作。
                     Thread.yield();   // initialization race
+                    // 下面将RUNSTATE 加上RSIGNAL标记(表示有线程在等待信号)
+                // 多个线程进入下面的cas时，只有第一个cas成功的时将RUNSTATE状态(没有RSIGNAL)打上了唤醒标记，其他后续通过自旋重新cas执行
+                // 都是幂等的，也就是重复设置RSIGNAL标记。后面的多个线程cas的时候会并发进入里面的逻辑，也就是并发执行synchronized代码块
+                // 第一个成功将RUNSTATE设置RSIGNAL 所起的作用是"改变状态"，后面失败的线程，发现状态已经有了RSIGNAL标志了，再CAS是为了确认
+                // 状态是否是RSIGNAL状态，目的是"确认状态"。 问题是第一个既然已经改了状态，那后面抢输的线程，重复操作，能不能别CAS了，直接去
+                // 睡觉不行吗?答案是不行，后面的cas能成功，也是rs首先是要signal 然后更新成signal，这样cas能成功，此时rs的状态肯定是signal
+                // 也就是以写带读，其实也就是相当于读取了状态。是要被唤醒的状态的前提下，当前线程才去wait()，这里要用synchronized控制同步，是
+                让wait的线程和notifyAll线程同步，不出现并发。如果这里换成park和unpark没有同步，就可能出现一个线程刚进来，准备park呢，另一个线程
+                unpark了，然后你再park，就会没人唤醒了。
+                这里让wait和notifyAll的线程同步就是保证，一个线程拿到锁只会进去wait，它wait这个锁不会释放，就没有线程能进入synchronized这段代码块
+                就不可能调用到notifyAll，完全是同步的，只要是notifyAll调用的时候，能进入这个线程的一定是wait了，不存再进去还没有wait，你notifyAll了，然后才wait，造成
+                一直wait
+
                 else if (U.compareAndSwapInt(this, RUNSTATE, rs, rs | RSIGNAL)) {
                     synchronized (lock) {
                         if ((runState & RSIGNAL) != 0) {
@@ -781,3 +847,38 @@ private void externalSubmit(ForkJoinTask<?> task) {
                 }
             }
         }
+
+
+
+        private void unlockRunState(int oldRunState, int newRunState) {
+                // 如果这里cas失败，代表解锁失败了，在解锁执行这个cas的时候oldRunState改变了，也许是shutdownNow()，或者其他原因导致的
+                // cas失败，完美解锁不可能了，就暴力覆盖+通知
+                // notifyAll是为了通知那些因为awaitRunStateLock里的线程。他们的等待没意义了，别等了，赶紧起来冲i性能检查条件。
+                if (!U.compareAndSwapInt(this, RUNSTATE, oldRunState, newRunState)) {
+                    Object lock = stealCounter;
+                    runState = newRunState;              // clears RSIGNAL bit
+                    if (lock != null)
+                        synchronized (lock) { lock.notifyAll(); }
+                }
+            }
+
+
+private ForkJoinPool(int parallelism,
+                         ForkJoinWorkerThreadFactory factory,
+                         UncaughtExceptionHandler handler,
+                         int mode,
+                         String workerNamePrefix) {
+        this.workerNamePrefix = workerNamePrefix;
+        this.factory = factory;
+        this.ueh = handler;
+        // 核心作用是将并行度和工作模式编码到一个整数config中
+        // parallelism & SMASK  只保留parallelism的低15位，确保并行度不超过32767(2^15-1)，避免数值溢出或非法配置
+        // 将处理后的并行度 与模式 mode进行按位或，把模式信息编码到config的高位部分。 由于mode的位域与SMASK覆盖的位域不重叠，因此不会互相覆盖
+        this.config = (parallelism & SMASK) | mode;
+        // 这里给np设置负数，不是为了表示"负数的线程数"，而是为了利用计算机底层的二进制补码特性，配合位运算来实现高效的原子计数控制。
+        // 负数是为了让"增加"和"减少"的操作在二进制层面变得统一和高效
+        // ctl的高位存储了两个关键计数器 AC(Active Count)  当前活跃的线程数(正在干活的) TC(Total Count) 当前存在的总线程数(包括正在干活的和正在休眠/等待任务的)
+        //
+        long np = (long)(-parallelism); // offset ctl counts
+        this.ctl = ((np << AC_SHIFT) & AC_MASK) | ((np << TC_SHIFT) & TC_MASK);
+    }
