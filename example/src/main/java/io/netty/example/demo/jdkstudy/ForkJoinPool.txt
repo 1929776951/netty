@@ -735,6 +735,13 @@ private void externalSubmit(ForkJoinTask<?> task) {
                     try {                      // locked version of push
                         if ((a != null && a.length > s + 1 - q.base) ||
                             (a = q.growArray()) != null) {
+                            // 这里是计算要将提交的任务放到这个队列的内部数组的哪个索引位置
+                            // ASHIFT是数组元素每个元素占用大小的对数，比如每个元素对象占用8  这个ASHIFT就是3
+                            // 左移ASHIFT就是乘以8的意思，效率比直接乘以8更高
+                            // (a.length - 1) & s
+                            // 比如数组长度是16 减去1就是 15  二进制的低四位 都是1    s可能已经是100了，那么按位与之后就是只保留低四位
+                            // 只会在0-15之间， 类似一个环形队列的操作。算出索引后，在计算内存偏移量，整个数组的其实内存地址偏移量ABASE+索引*每个元素的大小
+                            // 算这个内存地址偏移量是因为下面使用的U，即unsafe操作的。
                             int j = (((a.length - 1) & s) << ASHIFT) + ABASE;
                             U.putOrderedObject(a, j, task);
                             U.putOrderedInt(q, QTOP, s + 1);
@@ -882,3 +889,111 @@ private ForkJoinPool(int parallelism,
         long np = (long)(-parallelism); // offset ctl counts
         this.ctl = ((np << AC_SHIFT) & AC_MASK) | ((np << TC_SHIFT) & TC_MASK);
     }
+
+
+        //将当前任务数组容量翻倍(或初始化)
+        //在扩容过程中安全地迁移已有任务到新数组。保证并发场景下数据不丢失，不重复，且不阻塞队列的正常读写(尽可能无锁)
+        // 这个方法并发的来源
+            工作队列不是某个线程独占的
+            Owner所有者线程(当前工作线程) 每个队列绑定唯一创建它的工作线程 只有owner线程能调用当前方法扩容
+            其他线程(窃取者stealer) 池内其他空闲工作线程，会跨队列窃取对头任务，这是并发的根源
+            扩容是owner线程执行，但执行扩容全过程中，窃取线程会并发访问旧数组，分成2个阶段
+                1、owner执行array = new 新数组，切换引用后，这个切换赋值操作是原子的
+                 owner写新数组 vs与owner无冲突
+                 窃取线程读旧数组(迁移中) 旧数组还没倍丢弃，里面残留任务，其他stealer线程依然会调用poll()从旧数组base位置偷任务
+                 此时owner正在循环迁移旧数组任务，owner和窃取线程并发读写旧数组。
+        final ForkJoinTask<?>[] growArray() {
+            //保存当前是数组的引用
+            ForkJoinTask<?>[] oldA = array;
+            // 如果数组已经存在，容量<<1 即翻倍 否则初始化大小2^13 8192
+            int size = oldA != null ? oldA.length << 1 : INITIAL_QUEUE_CAPACITY;
+            if (size > MAXIMUM_QUEUE_CAPACITY)// 最大2^26次方 67108864
+                throw new RejectedExecutionException("Queue capacity exceeded");
+            int oldMask, t, b;
+            ForkJoinTask<?>[] a = array = new ForkJoinTask<?>[size];
+            // oldA !=null 旧数组不为空 不是初始化 可能有迁移的任务
+            // (oldMask = oldA.length - 1) >= 0 旧数组的长度大于等于1 掩码大于等于0
+            // (t = top) - (b = base) > 0 表示队列中存在待迁移任务
+            if (oldA != null && (oldMask = oldA.length - 1) >= 0 &&
+                (t = top) - (b = base) > 0) {
+                int mask = size - 1;
+                do { // emulate poll from old array, push to new array
+                    ForkJoinTask<?> x;
+                    int oldj = ((b & oldMask) << ASHIFT) + ABASE;
+                    int j    = ((b &    mask) << ASHIFT) + ABASE;
+                    x = (ForkJoinTask<?>)U.getObjectVolatile(oldA, oldj);
+                    if (x != null &&
+                        U.compareAndSwapObject(oldA, oldj, x, null))
+                        U.putObjectVolatile(a, j, x);
+                } while (++b != t);
+            }
+            return a;
+        }
+
+
+
+final void signalWork(WorkQueue[] ws, WorkQueue q) {
+        long c; int sp, i; WorkQueue v; Thread p;
+        while ((c = ctl) < 0L) {                       // too few active
+            //  c强转int是只保留低32位,低32位存储的是空闲线程数
+            if ((sp = (int)c) == 0) {                  // no idle workers
+                if ((c & ADD_WORKER) != 0L)            // too few workers
+                    tryAddWorker(c);
+                break;
+            }
+            if (ws == null)                            // unstarted/terminated
+                break;
+            if (ws.length <= (i = sp & SMASK))         // terminated
+                break;
+            if ((v = ws[i]) == null)                   // terminating
+                break;
+            int vs = (sp + SS_SEQ) & ~INACTIVE;        // next scanState
+            int d = sp - v.scanState;                  // screen CAS
+            long nc = (UC_MASK & (c + AC_UNIT)) | (SP_MASK & v.stackPred);
+            if (d == 0 && U.compareAndSwapLong(this, CTL, c, nc)) {
+                v.scanState = vs;                      // activate v
+                if ((p = v.parker) != null)
+                    U.unpark(p);
+                break;
+            }
+            if (q != null && q.base == q.top)          // no more work
+                break;
+        }
+    }
+
+
+
+        // Active counts
+        private static final int  AC_SHIFT   = 48; // 偏移量。表示活跃计数的数据位于64位整数的最高部分(第48到63位)
+        private static final long AC_UNIT    = 0x0001L << AC_SHIFT;//计数的单位值(1左移48位)。当需要增加或减少活跃线程数时，就加减这个值
+        private static final long AC_MASK    = 0xffffL << AC_SHIFT;// 掩码，用于从ctl中提取出活跃计数的数值。
+
+            00000000   00000000    00000000   00000000   00000000   00000000  00000000 00000000
+           64          56         48         40         32         24        16        8
+
+AC_MASK     11111111   11111111    00000000   00000000   00000000   00000000  00000000 00000000
+
+AC_UNIT     00000000   00000001    00000000   00000000   00000000   00000000  00000000 00000000
+
+
+        // Total counts
+        private static final int  TC_SHIFT   = 32;
+        private static final long TC_UNIT    = 0x0001L << TC_SHIFT;
+        private static final long TC_MASK    = 0xffffL << TC_SHIFT;
+        private static final long ADD_WORKER = 0x0001L << (TC_SHIFT + 15); // sign
+
+
+            00000000    00000000    00000000   00000000   00000000   00000000  00000000 00000000
+           64          56          48         40         32         24        16        8
+
+TC_UNIT     00000000   00000000    00000000   00000001   00000000   00000000  00000000 00000000
+
+TC_MASK     00000000   00000000    11111111   11111111   00000000   00000000  00000000 00000000
+
+
+ADD_WORKER  00000000   00000000    10000000   00000000   00000000   00000000  00000000 00000000
+
+
+
+
+
